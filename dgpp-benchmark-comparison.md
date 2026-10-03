@@ -48,6 +48,22 @@ Read: the forum Qwen figures remain about 1.5–1.8× above DGPP's current Qwen 
 
 DGPP publishes task-level quality with every throughput table: HumanEval 94.5–96.3%, GSM8K 97–100% of denominators, schema extraction 100/100, plus MTP==greedy transcript identity and cross-rank op-stream md5 identity as pass/fail gates. The forum's only task-quality datapoint is tsarihan's SWE-bench Pro enterprise-40 (382697): Qwen 36–38, GLM 36, DSv4 33 (needs thinking=true + temp 1.0, else 22/40). Suites do not overlap — not comparable; treat DGPP's quality gate as an extra control the forum numbers don't have.
 
+## 6. Engine architecture map
+
+The diagram below is generated from the repo source (rev 904f76c) with archify — interactive HTML (pan/zoom, theme, trace, export): [`~/dgpp-architecture.html`](../../dgpp-architecture.html) (spec `fc2d17fc05037599`, artifact `b8a35fa51583bdf7`, `visual-check` pass).
+
+```html
+<iframe src="../../dgpp-architecture.html" style="width:100%;height:720px;border:0;border-radius:8px"></iframe>
+```
+
+If the embed does not render in your viewer, open the file directly. Node copy matches the source tree:
+
+- **Request path:** API clients → HTTP frontend (`serve/http_server`, OpenAI-compatible) → generation service (`serve/generation_service`, vision frontend) → scheduler (`sched/scheduler` + `sched/prefix_cache`) → graph engine (`engine/graph_engine`, MTP speculative decode).
+- **Prefill economics (rev 904f76c):** resumable prefill with a **256 tok/tick busy budget** (`resolve_prefill_policy` auto) — admission-gated at 4 slots / queue 8, not chunking-gated.
+- **Verify schedule** (`engine/verify_schedule`): confidence-scheduled verify depth implemented but **OFF in every shipped template** — dormant knob #1 for a test window.
+- **Model lanes:** GLM lane (`models/glm`, NVFP4/FP8 hybrid — stalled since Sep 22) and Qwen lane (`models/qwen`, `mimo`, `dsv41` — active, packed int4 work lands here) share the CUDA kernel library (`kernels/`) and the checkpoint loader (`loaders/`).
+- **TP2 fabric:** first-party collective bus (`net/collective_bus`, verbs/RDMA over RoCE, no NCCL) to the rank-1 node (`dgpp-serve --rank 1` on dgx2).
+
 ## Caveats — where this is not like-for-like
 
 1. **Method.** DGPP: 3-run medians, fixed 5-class prompt set, client-side aggregates, determinism-gated. Forum: single runs, self-chosen prompts, and headline numbers are often peaks. Peak-vs-median on the same stack spans ~1.5–2× (e.g. 382476's own median-vs-peak rows).
