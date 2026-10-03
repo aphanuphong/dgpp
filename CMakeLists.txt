@@ -126,6 +126,14 @@ add_library(dgpp_core STATIC
   src/core/trace.cpp)
 dgpp_set_common(dgpp_core)
 
+# The display-reclaim span (2026-10-03): the GB10 display carveout backing
+# the prefix arena. CUDA-only, kept out of dgpp_core (host-only); only the
+# serve links it.
+add_library(dgpp_display STATIC
+  src/core/display_span.cpp)
+target_link_libraries(dgpp_display PUBLIC dgpp_core CUDA::cudart)
+dgpp_set_common(dgpp_display)
+
 # M5 control plane: TCP roster/startup/health (host-only; no CUDA).
 add_library(dgpp_net STATIC
   src/net/tcp.cpp
@@ -680,7 +688,7 @@ if(DGPP_ENABLE_IBV)
   add_executable(dgpp_serve_app apps/dgpp_serve.cpp)
   target_link_libraries(dgpp_serve_app PRIVATE dgpp_models_glm_loader dgpp_models_qwen_layers dgpp_models_glm4_layers dgpp_models_glm_dsa_layers
                                              dgpp_models_dsv41_layers dgpp_models_mimo_layers
-                                             dgpp_loaders dgpp_bus
+                                             dgpp_loaders dgpp_bus dgpp_display
                                              dgpp_serve CUDA::cudart
                                              Threads::Threads)
   dgpp_set_common(dgpp_serve_app)

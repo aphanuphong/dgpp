@@ -16,6 +16,7 @@
 #include <vector>
 
 #include "common/cuda_check.hpp"
+#include "core/display_span.hpp"
 
 namespace dgpp {
 
@@ -31,7 +32,15 @@ class PrefixArena {
       if (bytes_ == 0)
         throw std::invalid_argument(
             "PrefixArena: the model has no session state to snapshot");
-      DGPP_CUDA_OK(cudaMalloc(&base_, bytes_ * static_cast<size_t>(slots_)));
+      const size_t total = bytes_ * static_cast<size_t>(slots_);
+      // The display-reclaim span (2026-10-03): when the serve reserved one
+      // of exactly this arena's size, its backing comes from the display
+      // carveout instead of device memory. Otherwise (knob off, or the
+      // display device unavailable) the ordinary allocation runs.
+      base_ = consume_display_span(total);
+      span_backed_ = base_ != nullptr;
+      if (base_ == nullptr)
+        DGPP_CUDA_OK(cudaMalloc(&base_, total));
       metas_.resize(static_cast<size_t>(slots_));
       filled_.assign(static_cast<size_t>(slots_), false);
       for (Timer& t : timers_) {  // timing events (the default flags)
@@ -53,7 +62,7 @@ class PrefixArena {
         cudaEventDestroy(t.start);
         cudaEventDestroy(t.end);
       }
-    if (base_) cudaFree(base_);
+    if (base_ != nullptr && !span_backed_) cudaFree(base_);
   }
   PrefixArena(const PrefixArena&) = delete;
   PrefixArena& operator=(const PrefixArena&) = delete;
@@ -210,6 +219,7 @@ class PrefixArena {
   int slots_ = 0;
   size_t bytes_ = 0;
   void* base_ = nullptr;
+  bool span_backed_ = false;  // display-span backing: never cudaFree'd (dies with the process)
   std::vector<typename Model::SessionSnapshotMeta> metas_;
   std::vector<bool> filled_;
   static constexpr int kTimers = 4;

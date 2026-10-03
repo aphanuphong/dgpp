@@ -155,6 +155,7 @@ struct WorldSettings {
   int graph_batch_min_live = 0;
   int sampling_candidates = 0;
   double prefix_cache_gib = 0.0;
+  bool display_kv = false;  // the arena's backing: the display carveout (2026-10-03); absent legacy field = off
   std::string admission;
   int admission_window = 0;
   int prefill_budget_tokens = 0;  // settings: -1 = automatic; absent legacy field = disabled

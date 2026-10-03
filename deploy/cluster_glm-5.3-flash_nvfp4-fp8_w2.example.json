@@ -4,7 +4,7 @@
   "release": "",
   "engine": {
     "max_concurrency": 4,
-    "kv_capacity": 163840,
+    "kv_capacity": 786432,
     "kv_dtype": "fp8",
     "bf16_weights": "bf12",
     "default_max_tokens": 32768,
@@ -13,6 +13,7 @@
     "decode_graph": true,
     "mtp": true,
     "prefix_cache_gib": 4.5,
+    "display_kv": true,
     "admission": "full",
     "admission_window": 256,
     "sampling_candidates": 128,

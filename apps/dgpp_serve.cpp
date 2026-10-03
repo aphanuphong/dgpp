@@ -62,6 +62,7 @@
 #include "common/cuda_check.hpp"
 #include "common/log.hpp"
 #include "common/process_memory.hpp"
+#include "core/display_span.hpp"
 #include "kernels/bf12_companions.hpp"
 #include "kernels/latent_format.hpp"
 #include "loaders/hf_cache.hpp"
@@ -1183,7 +1184,9 @@ int main(int argc, char** argv) {
       "  prefix cache (M7): [--prefix-cache-gib X (default 1.5)]: the\n"
       "    snapshot arena per rank (slots = X GiB / one session's state);\n"
       "    [--no-prefix-cache] turns it off; every rank takes rank 0's slot\n"
-      "    count from the warm record\n"
+      "    count from the warm record; [--display-kv] backs the arena from\n"
+      "    the display carveout (needs /dev/dri/card0 + nvidia_drm modeset,\n"
+      "    falls back to device memory when unavailable)\n"
       "  admission (M6 6d): [--admission full|grow (default full)]\n"
       "    [--admission-window N (default 256)]: grow reserves prompt + N\n"
       "    tokens, grows at tick top, and sheds the youngest request\n"
@@ -1273,6 +1276,7 @@ int main(int argc, char** argv) {
   int mtp_schedule_min_depth = 1;
   bool mtp_schedule_adapt = true;  // lambda follows the modeled throughput (floored at the configured lambda)
   double prefix_cache_gib = 1.5;  // M7: the snapshot arena; 0 = off
+  bool display_kv = false;        // the arena's backing comes from the display carveout (2026-10-03)
   std::optional<float> temperature, top_p, min_p, repetition_penalty;
   std::optional<int> top_k;
   std::optional<uint64_t> fixed_seed;
@@ -1358,6 +1362,7 @@ int main(int argc, char** argv) {
     graph_batch_min_live = e.graph_batch_min_live;
     sampling_candidates = e.sampling_candidates;
     prefix_cache_gib = e.prefix_cache_gib;
+    display_kv = e.display_kv;
     admission_mode = e.admission;
     admission_window = e.admission_window;
     model_alias = e.model_alias;
@@ -1451,6 +1456,8 @@ int main(int argc, char** argv) {
     else if (a == "--sampling-candidates") sampling_candidates = std::stoi(next());
     else if (a == "--prefix-cache-gib") prefix_cache_gib = std::stod(next());
     else if (a == "--no-prefix-cache") prefix_cache_gib = 0.0;
+    else if (a == "--display-kv") display_kv = true;
+    else if (a == "--no-display-kv") display_kv = false;
     else if (a == "--admission") admission_mode = next();
     else if (a == "--admission-window") admission_window = std::stoi(next());
     else if (a == "--prefill-budget-tokens") prefill_budget_tokens = std::stoi(next());
@@ -1535,7 +1542,7 @@ int main(int argc, char** argv) {
         "eos={} graph={} compact={} mtp={} mtpd={} mss={} msrow={} msbase={} mslam={} msmin={} "
         "msad={} "
         "batchmin={} cand={} "
-        "pcgib={} adm={} win={} pfbudget={} pfidle={} pmin={} phead={} pace={} inflight={} "
+        "pcgib={} adm={} win={} pfbudget={} pfidle={} pmin={} phead={} dkv={} pace={} inflight={} "
         "reasoning_in_content={} "
         "rs={}",
         model_id.empty() ? ckpt : model_id, world, fabric_port, journal_port, max_concurrency,
@@ -1545,7 +1552,7 @@ int main(int argc, char** argv) {
         mtp_schedule_base_ms, mtp_schedule_lambda, mtp_schedule_min_depth,
         mtp_schedule_adapt ? 1 : 0, effective_batch_min_live, sampling_candidates, prefix_cache_gib,
         admission_mode, admission_window, prefill_budget_tokens, prefill_idle_budget_tokens,
-        prefix_min_tokens, prefix_head_snapshots ? 1 : 0,
+        prefix_min_tokens, prefix_head_snapshots ? 1 : 0, display_kv ? 1 : 0,
         bulk_pace_gbps, bulk_inflight, reasoning_in_content ? 1 : 0,
         rope_scaling ? std::format("yarn:{}:{}:{}:{}:{}:{}", rope_scaling->factor,
                                    rope_scaling->original_max_position_embeddings,
@@ -1609,6 +1616,7 @@ int main(int argc, char** argv) {
         ws.graph_batch_min_live = graph_batch_min_live;
         ws.sampling_candidates = sampling_candidates;
         ws.prefix_cache_gib = prefix_cache_gib;
+        ws.display_kv = display_kv;
         ws.admission = admission_mode;
         ws.admission_window = admission_window;
         ws.prefill_budget_tokens = prefill_budget_tokens;
@@ -1674,6 +1682,7 @@ int main(int argc, char** argv) {
         graph_batch_min_live = ws.graph_batch_min_live;
         sampling_candidates = ws.sampling_candidates;
         prefix_cache_gib = ws.prefix_cache_gib;
+        display_kv = ws.display_kv;
         admission_mode = ws.admission;
         admission_window = ws.admission_window;
         prefill_budget_tokens = ws.prefill_budget_tokens;
@@ -2320,12 +2329,22 @@ int main(int argc, char** argv) {
         // geometry, and the warm record carries rank 0's for the peers to
         // check against.
         const int prefix_slots = prefix_arena_slots(family->model_snapshot_bytes(), prefix_cache_gib);
+        // The display-reclaim span (2026-10-03): claimed at exactly this
+        // arena's size before the engine constructs it; the arena takes it
+        // in its constructor, or device memory when the claim failed.
+        if (display_kv && prefix_slots > 0)
+          dgpp::reserve_display_span(static_cast<size_t>(prefix_slots) *
+                                     family->model_snapshot_bytes());
         DGPP_LOG_INFO(
             "rank {}: prefix cache {} — {} snapshot slot(s) of {:.1f} MiB "
-            "({:.2f} GiB asked)",
+            "({:.2f} GiB asked){}",
             rank, prefix_slots > 0 ? "on" : "off", prefix_slots,
             static_cast<double>(family->model_snapshot_bytes()) / (1024.0 * 1024.0),
-            prefix_cache_gib);
+            prefix_cache_gib,
+            display_kv ? (dgpp::display_span_reserved_bytes() > 0
+                              ? ", display-span backed"
+                              : ", display span unavailable (device memory)")
+                       : "");
         // The admission policy every rank runs (M6 6d): rank 0's, carried
         // by the warm record; a peer's own flags yield to it.
         dgpp::sched::AdmissionPolicy peer_policy = knobs.admission;
@@ -2523,9 +2542,16 @@ int main(int argc, char** argv) {
         forward_rows);
 
     const int prefix_slots = prefix_arena_slots(family->model_snapshot_bytes(), prefix_cache_gib);
-    DGPP_LOG_INFO("serve: prefix cache {} — {} snapshot slot(s) of {:.1f} MiB",
+    if (display_kv && prefix_slots > 0)
+      dgpp::reserve_display_span(static_cast<size_t>(prefix_slots) *
+                                 family->model_snapshot_bytes());
+    DGPP_LOG_INFO("serve: prefix cache {} — {} snapshot slot(s) of {:.1f} MiB{}",
                   prefix_slots > 0 ? "on" : "off", prefix_slots,
-                  static_cast<double>(family->model_snapshot_bytes()) / (1024.0 * 1024.0));
+                  static_cast<double>(family->model_snapshot_bytes()) / (1024.0 * 1024.0),
+                  display_kv ? (dgpp::display_span_reserved_bytes() > 0
+                                    ? ", display-span backed"
+                                    : ", display span unavailable (device memory)")
+                             : "");
     std::unique_ptr<dgpp::sched::SchedulerEngine> engine = family->make_eager_engine(
         max_concurrency, dgpp::make_w1_pick(family->vocab_size()), dgpp::make_w1_sample(family->vocab_size()),
         &grammar_vocab, prefix_slots);
