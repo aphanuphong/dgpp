@@ -41,6 +41,13 @@ struct DestroyDumb {
 };
 
 // <sys/ioctl.h>'s _IOWR: direction | size | type | nr.
+// Verified against the kernel UAPI on GB10 (driver 580.178.04):
+//   DRM_IOCTL_MODE_CREATE_DUMB  = 0xc02064b2
+//   DRM_IOCTL_MODE_MAP_DUMB     = 0xc01064b3
+//   DRM_IOCTL_MODE_DESTROY_DUMB = 0xc00464b4
+// i.e. type 'd', nr 0xB2..0xB4, direction _IOWR (3 << 30). The old
+// _IOW encoding (2 << 30) made the kernel reject every call with
+// -EINVAL because the command never matched the dispatch switch.
 constexpr unsigned int kIoctlType = 'd';
 constexpr unsigned int kNrCreate = 0xB2;
 constexpr unsigned int kNrMap = 0xB3;
@@ -48,7 +55,7 @@ constexpr unsigned int kNrDestroy = 0xB4;
 
 template <class T>
 constexpr unsigned int iowr(unsigned int nr) {
-  return (2U << 30) | ((sizeof(T) & 0x3FFFU) << 16) | (kIoctlType << 8) | nr;
+  return (3U << 30) | ((sizeof(T) & 0x3FFFU) << 16) | (kIoctlType << 8) | nr;
 }
 
 constexpr unsigned int kIoctlCreate = iowr<CreateDumb>(kNrCreate);
