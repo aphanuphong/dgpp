@@ -326,6 +326,13 @@ class GenerationService : public HttpHandler,
     double ttft_hit_ms = 0;
     uint64_t ttft_miss_count = 0;
     double ttft_miss_ms = 0;
+    // Queue wait (door to scheduler admission) and inter-token gaps (the
+    // spacing of consecutive token arrivals per request), cumulative
+    // (sum_ms, count) pairs — the /metrics `latency` section.
+    double queue_ms = 0;
+    uint64_t queue_count = 0;
+    double itl_ms = 0;
+    uint64_t itl_count = 0;
   };
   Stats stats() const;
   // The scheduler's meters as published after the last engine pass (the
@@ -411,6 +418,8 @@ class GenerationService : public HttpHandler,
     // The prefix cache (M7): when the request arrived at the door, whether
     // it attached to an entry and at what position (the TTFT split).
     std::chrono::steady_clock::time_point arrived;
+    // The previous token's arrival (the inter-token gap accounting).
+    std::chrono::steady_clock::time_point last_token_at;
     bool prefix_hit = false;
     int64_t prefix_position = 0;
     // UTF-8 carries (the soak's find, 2026-09-05): a byte-level BPE token

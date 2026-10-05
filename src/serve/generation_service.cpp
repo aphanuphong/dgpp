@@ -2527,6 +2527,20 @@ void GenerationService::route_metrics(HttpResponseWriter& w) {  Scheduler::Meter
     std::snprintf(buf, sizeof(buf), ",\"%s\":%.3f", key, v);
     out.append(buf);
   };
+  // Latency accounting, cumulative (sum_ms, count) pairs dashboards can
+  // window: the queue wait (door to scheduler admission) and the
+  // inter-token gaps.
+  out.append(",\"latency\":{\"queue_time_ms_sum\":");
+  std::snprintf(buf, sizeof(buf), "%.3f", st.queue_ms);
+  out.append(buf);
+  out.append(",\"queue_time_ms_count\":");
+  append_json_int(&out, static_cast<int64_t>(st.queue_count));
+  out.append(",\"inter_token_latency_ms_sum\":");
+  std::snprintf(buf, sizeof(buf), "%.3f", st.itl_ms);
+  out.append(buf);
+  out.append(",\"inter_token_latency_ms_count\":");
+  append_json_int(&out, static_cast<int64_t>(st.itl_count));
+  out.append("}");
   out.append(",\"prefix_cache\":{\"enabled\":");
   out.append(m.prefix_slots > 0 ? "true" : "false");
   out.append(",\"slots\":");
@@ -2792,12 +2806,12 @@ void GenerationService::on_token(const std::string& id, int64_t token,
     std::lock_guard<std::mutex> lock(mutex_);
     for (auto& r : records_) {
       if (r->sched_id != id || r->done) continue;
+      const auto now = std::chrono::steady_clock::now();
       if (steps_done == 1) {
         // The first token: the time to first token, split by whether the
         // prefix cache served the prompt's head (M7).
-        const double ms = std::chrono::duration<double, std::milli>(
-                              std::chrono::steady_clock::now() - r->arrived)
-                              .count();
+        const double ms =
+            std::chrono::duration<double, std::milli>(now - r->arrived).count();
         if (r->prefix_hit) {
           stats_.ttft_hit_count++;
           stats_.ttft_hit_ms += ms;
@@ -2805,7 +2819,17 @@ void GenerationService::on_token(const std::string& id, int64_t token,
           stats_.ttft_miss_count++;
           stats_.ttft_miss_ms += ms;
         }
+      } else if (steps_done > 1) {
+        // Later tokens: the inter-token gap — the spacing of consecutive
+        // token arrivals of this choice. A speculative step's extra tokens
+        // land back-to-back; the gap is the honest arrival spacing the
+        // client sees.
+        stats_.itl_ms +=
+            std::chrono::duration<double, std::milli>(now - r->last_token_at)
+                .count();
+        ++stats_.itl_count;
       }
+      r->last_token_at = now;
       r->ids.push_back(token);
       if (r->logprobs >= 0) r->content_lps.push_back(false);
       if (r->chat) {
@@ -3454,6 +3478,10 @@ bool GenerationService::engine_pass(const PreTickHook& pre_tick) {
     stops.swap(pending_stops_);
   }
   PassEvents events;
+  // The admissions' queue wait, accumulated lock-free and flushed to the
+  // stats in one lock (stats_ is mutex-guarded; the loop is not).
+  double queue_ms = 0;
+  uint64_t queue_count = 0;
   for (auto& a : admissions) {
     bool admitted = false;
     bool journaled = false;
@@ -3484,7 +3512,21 @@ bool GenerationService::engine_pass(const PreTickHook& pre_tick) {
         a.record->group->counted_shed = true;
         ++stats_.requests_shed;
       }
+    } else {
+      // Queue wait: the door to scheduler admission — the time the request
+      // spent waiting for the engine thread to take it (the queue component
+      // of its TTFT, tracked on its own for the /metrics `latency` section).
+      // Shed requests never generate and are not counted.
+      queue_ms += std::chrono::duration<double, std::milli>(
+                      std::chrono::steady_clock::now() - a.record->arrived)
+                      .count();
+      ++queue_count;
     }
+  }
+  if (queue_count > 0) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    stats_.queue_ms += queue_ms;
+    stats_.queue_count += queue_count;
   }
   for (const auto& c : cancels) {
     // Only cancels that HIT ride the journal (rank 0's scheduler state

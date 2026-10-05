@@ -3585,7 +3585,10 @@ DGPP_TEST(serve_prefixCache_boundariesAttachOptOutAndMetrics) {
   require(met.find("\"prefix_cache\":{\"enabled\":true,\"slots\":4") != std::string::npos &&
               met.find("\"hits\":1,\"misses\":1,\"tokens_saved\":4") != std::string::npos &&
               met.find("\"ttft_hit_count\":1") != std::string::npos &&
-              met.find("\"ttft_miss_count\":2") != std::string::npos,
+              met.find("\"ttft_miss_count\":2") != std::string::npos &&
+              met.find("\"latency\":{\"queue_time_ms_sum\":") != std::string::npos &&
+              met.find("\"queue_time_ms_count\":3") != std::string::npos &&
+              met.find("\"inter_token_latency_ms_count\":6") != std::string::npos,
           "metrics: " + met);
 }
 
