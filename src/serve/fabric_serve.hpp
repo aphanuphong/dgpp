@@ -129,6 +129,17 @@ struct WorldSettings {
   bool prefill_bf16_partials = false;        // the opt-in prefill levers (2026-09-30); absent legacy field = off
   bool prefill_fold_scales = false;
   bool prefill_fp8_gemm = false;
+  bool prefill_fp8_per_tensor = false;  // the Qwen3.8-27B per-tensor prefill recipe (opt-in)
+  std::string dflash_model;             // the DFlash2 drafter (Qwen3.8-27B, world 1); empty: none
+  bool dflash_verify_graph = true;
+  bool prefill_group = true;  // engine.prefill_group (2026-10-05): every rank admits the same way
+  // engine.l2_prefetch* (2026-10-05): every rank prefetches the same way (the step's timing).
+  bool l2_prefetch = true, l2_prefetch_merge = true;
+  std::string l2_prefetch_form = "load", l2_prefetch_boundary_rate = "light", l2_prefetch_layer_rate = "light";
+  int l2_prefetch_window_mib = 12, l2_prefetch_boundary_window_mib = 20;
+  bool dflash_draft_batch = true;
+  int dflash_depth = 0;
+  std::string dflash_weights = "checkpoint";  // engine.dflash_weights: every rank serves the drafter the same way
   std::string expert_gemm = "wide";          // the packed expert GEMM's form (2026-09-30); absent legacy field = wide
   int expert_gemm_prefetch = 3;
   bool expert_tile_list = true;
@@ -152,6 +163,11 @@ struct WorldSettings {
   double mtp_schedule_lambda = 0.0;
   int mtp_schedule_min_depth = 1;
   bool mtp_schedule_adapt = true;
+  double mtp_schedule_sampled_scale = 0.93;  // engine.mtp_schedule_sampled_scale
+  std::string mtp_draft = "auto";  // engine.mtp_draft: every rank resolves the same rule
+  double mtp_draft_temperature = 1.0;  // engine.mtp_draft_temperature: every rank draws the same chain
+  std::string mtp_verify = "token";  // engine.mtp_verify: every rank decides the chain by the same rule
+  int dflash_batch_rows = 0;  // engine.dflash_batch_rows: every rank batches the same rows
   int graph_batch_min_live = 0;
   int sampling_candidates = 0;
   double prefix_cache_gib = 0.0;
@@ -330,6 +346,9 @@ void run_journal_peer(dgpp::sched::Scheduler* sched, JournalReader* reader,
                       const std::function<void()>& on_rank0_death = nullptr,
                       int watch_poll_ms = 100,
                       const dgpp::sched::SchedulerObserver* oplog = nullptr,
-                      ThroughputLog* stats = nullptr);
+                      ThroughputLog* stats = nullptr,
+                      // After every applied tick: the meters and the ticks so
+                      // far (the peer's metrics listener publishes them).
+                      const std::function<void(const dgpp::sched::Scheduler::Meters&, int64_t)>& on_tick = {});
 
 }  // namespace dgpp::serve

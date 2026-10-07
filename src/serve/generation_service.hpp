@@ -91,6 +91,8 @@
 #include "sched/scheduler.hpp"
 #include "text/tool_parser.hpp"
 #include "serve/http_server.hpp"
+#include "serve/prometheus.hpp"
+#include "serve/rank_metrics.hpp"
 
 namespace dgpp::serve {
 
@@ -165,6 +167,7 @@ struct ServiceConfig {
   std::string model_id;
   int default_max_tokens = 256;  // when the request omits max_tokens
   int queue_limit = 64;          // admission bound; beyond → 503
+  int admission_gather_ms = 3;   // an idle engine's wait for the rest of an arriving burst (0: none)
   int sse_ping_interval = kDefaultSsePingInterval;  // seconds; -1 disables
   dgpp::sched::AdmissionPolicy admission;  // full-reserve unless told otherwise
   // The sampling defaults every omitted request field takes: the
@@ -204,6 +207,11 @@ struct ServiceConfig {
   std::optional<dgpp::RopeScaling> rope_scaling;
   int64_t position_ceiling = 0;
   int64_t kv_pool_tokens = 0;
+  // The build and world /metrics/prometheus reports on dgpp_build_info
+  // (the app fills them; empty / 1 in the host rigs).
+  std::string build_version;
+  std::string build_git_sha;
+  int world_size = 1;
 };
 
 // The stop-string scanner (OpenAI's `stop`, 2026-09-06). Fed the visible
@@ -273,6 +281,13 @@ class GenerationService : public HttpHandler,
   // engine thread). The fabric verification hashes the per-rank streams
   // against each other — the smoke's md5 procedure, serving edition. w1
   // leaves it unset.
+  // Rank 0's own dgpp_rank_* families on /metrics/prometheus (the peers
+  // serve theirs on their metrics listeners); `collectives` may be null.
+  void set_rank_metrics(RankIdentity id, const std::atomic<uint64_t>* collectives) {
+    rank_identity_ = std::move(id);
+    rank_collectives_ = collectives;
+    rank_metrics_ = true;
+  }
   void set_audit_observer(dgpp::sched::SchedulerObserver* audit) {
     audit_ = audit;
   }
@@ -333,6 +348,27 @@ class GenerationService : public HttpHandler,
     uint64_t queue_count = 0;
     double itl_ms = 0;
     uint64_t itl_count = 0;
+    // The distributions behind /metrics/prometheus, in seconds or tokens:
+    // door to first token (split by prefix-cache attach), door to slot
+    // (queue), slot to first token (prefill), first token to retire
+    // (decode), door to retire (end to end), the decode time per output
+    // token after the first, the gap between engine passes that delivered
+    // a request's tokens, the per-request prompt and generation sizes, and
+    // the engine's mean step time per pass (weighted by the pass's steps).
+    prom::Histogram ttft_hit_s{prom::latency_buckets()};
+    prom::Histogram ttft_miss_s{prom::latency_buckets()};
+    prom::Histogram queue_s{prom::latency_buckets()};
+    prom::Histogram prefill_s{prom::latency_buckets()};
+    prom::Histogram decode_s{prom::latency_buckets()};
+    prom::Histogram e2e_s{prom::latency_buckets()};
+    prom::Histogram tpot_s{prom::step_buckets()};
+    prom::Histogram itl_s{prom::step_buckets()};
+    prom::Histogram step_s{prom::step_buckets()};
+    prom::Histogram prompt_tokens{prom::token_buckets()};
+    prom::Histogram generation_tokens{prom::token_buckets()};
+    // Retired requests by scheduler reason (Scheduler::Result::Reason).
+    static constexpr int kReasons = 6;
+    uint64_t finished[kReasons] = {};
   };
   Stats stats() const;
   // The scheduler's meters as published after the last engine pass (the
@@ -420,6 +456,17 @@ class GenerationService : public HttpHandler,
     std::chrono::steady_clock::time_point arrived;
     // The previous token's arrival (the inter-token gap accounting).
     std::chrono::steady_clock::time_point last_token_at;
+    // The latency distributions (/metrics/prometheus): when the scheduler
+    // gave the request a slot (the queue's end, the prefill's start), its
+    // first token, and the last engine pass that delivered tokens with the
+    // count it had then (one inter-token observation per pass: MTP lands
+    // several tokens at once).
+    bool admit_seen = false;
+    std::chrono::steady_clock::time_point admitted_at;
+    bool first_token_seen = false;
+    std::chrono::steady_clock::time_point first_token_at;
+    std::chrono::steady_clock::time_point last_pass_at;
+    size_t last_pass_tokens = 0;
     bool prefix_hit = false;
     int64_t prefix_position = 0;
     // UTF-8 carries (the soak's find, 2026-09-05): a byte-level BPE token
@@ -461,6 +508,11 @@ class GenerationService : public HttpHandler,
   void route_health(HttpResponseWriter& w) const;
   void route_metrics(HttpResponseWriter& w);
   void route_metrics_prometheus(HttpResponseWriter& w);
+  // Both metrics routes' live gauges (under mutex_): admissions whose
+  // synchronous prefill has not returned count as active, requests still
+  // waiting in the HTTP queue as queued.
+  void count_live(dgpp::sched::Scheduler::Meters* m,
+                  const std::vector<dgpp::PrefillMonitor::Request>& prefills) const;
   bool validate_chat_parameters(const minijson::Value& body, HttpResponseWriter& w);
   bool parse_max_tokens(const minijson::Value& body, HttpResponseWriter& w, int* steps, bool chat);
   // OpenAI's ignore_eos: generate to the token limit whatever is drawn.
@@ -542,6 +594,9 @@ class GenerationService : public HttpHandler,
                              size_t to = SIZE_MAX) const;
   void on_retire(const std::string& id,
                  const dgpp::sched::Scheduler::Result& result) override;
+  // Under mutex_: observe a pass's new tokens once, including its final
+  // batch before the HTTP pump can remove a retired record.
+  void observe_token_pass(StreamRecord& r, std::chrono::steady_clock::time_point now);
   // Grow-on-demand's growth events (M6 6d) ride to the audit observer:
   // they are rank-identical scheduler state, so the op streams carry them.
   void on_grow(const std::string& id, int64_t reserved_tokens) override {
@@ -551,6 +606,8 @@ class GenerationService : public HttpHandler,
   // attach marks the record for the TTFT split.
   void on_prefix(const std::string& id, const char* op, int64_t position,
                  int slot) override;
+  // A request got its slot: the queue-time / prefill-time split.
+  void on_admit(const std::string& id, int slot) override;
   // The prompt's structural boundaries: every position (>= 1) holding one
   // of the frontend's boundary tokens.
   std::vector<int64_t> prompt_boundaries(const std::vector<int64_t>& prompt) const;
@@ -599,6 +656,13 @@ class GenerationService : public HttpHandler,
   dgpp::sched::Scheduler::Meters meters_;  // engine-published, mutex-guarded
   dgpp::sched::SchedulerEngine::PrefixEngineStats prefix_stats_;
   std::chrono::steady_clock::time_point meters_published_ = std::chrono::steady_clock::now();
+  // The step-time histogram's watermark: the decode steps and step wall
+  // time already observed (engine pass, under mutex_).
+  int64_t observed_decode_steps_ = 0;
+  bool rank_metrics_ = false;  // set before serving, read-only after
+  RankIdentity rank_identity_;
+  const std::atomic<uint64_t>* rank_collectives_ = nullptr;
+  double observed_step_ms_ = 0.0;
   bool shutdown_ = false;
   bool failed_ = false;      // fail_engine() happened
   std::string failure_;      // its reason (the clients' message carries it)

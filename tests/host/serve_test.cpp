@@ -48,6 +48,7 @@
 #include "serve/serve_stats.hpp"
 #include "text/chat_template.hpp"
 #include "text/dsv41_prompt.hpp"
+#include "text/dsv4_prompt.hpp"
 
 namespace {
 
@@ -456,8 +457,9 @@ class FakeFrontend : public ModelFrontend {
     return input;
   }
 
-  explicit FakeFrontend(bool with_markers = false, bool with_dsml = false)
-      : with_markers_(with_markers), with_dsml_(with_dsml) {}
+  explicit FakeFrontend(bool with_markers = false, bool with_dsml = false,
+                        dgpp::text::DsmlDialect dsml_dialect = dgpp::text::DsmlDialect::kV41)
+      : with_markers_(with_markers), with_dsml_(with_dsml), dsml_dialect_(dsml_dialect) {}
   // The template knob gate: a template that reads enable_thinking (Qwen3.8-
   // Flash-Next, GLM-4.7) accepts it in chat_template_kwargs; the default
   // fake, like GLM-5.3-Flash's template, does not.
@@ -531,6 +533,7 @@ class FakeFrontend : public ModelFrontend {
     m.think_close = {kThinkClose, "</think>"};
     if (with_dsml_) {
       m.dsml = {kDsml, "｜DSML｜"};
+      m.dsml_dialect = dsml_dialect_;
       return m;
     }
     m.tool_call_open = {kToolOpen, "<tool_call>"};
@@ -554,6 +557,7 @@ class FakeFrontend : public ModelFrontend {
  private:
   bool with_markers_;
   bool with_dsml_;
+  dgpp::text::DsmlDialect dsml_dialect_;
   mutable std::mutex mu_;
   mutable std::string last_globals_;
 };
@@ -677,9 +681,10 @@ struct ServiceRig {
                       int64_t position_ceiling = 0, int64_t kv_pool_tokens = 0,
                       bool resumable_prefill = false, bool with_dsml = false,
                       std::string default_chat_template_kwargs = "{}",
-                      int sse_ping_interval = dgpp::serve::kDefaultSsePingInterval)
+                      int sse_ping_interval = dgpp::serve::kDefaultSsePingInterval,
+                      dgpp::text::DsmlDialect dsml_dialect = dgpp::text::DsmlDialect::kV41)
       : engine(kSlots, /*total_blocks=*/100, /*block_tokens=*/4, can_sample),
-        frontend(with_markers, with_dsml),
+        frontend(with_markers, with_dsml, dsml_dialect),
         cfg([&] {
           ServiceConfig c;
           c.model_id = "glm-5.3-flash-fp8";
@@ -1293,6 +1298,134 @@ DGPP_TEST(serve_modelsHealthMetrics_theOpsSurface) {
       require(json_of(m.value) == json_of(second.root.at("scheduler").at(m.key)), "scheduler gauges agree");
 }
 
+DGPP_TEST(serve_prometheusExposition_countersAndDistributions) {
+  // GIVEN the service after one chat completion (prompt 4, three tokens,
+  // the steps cap),
+  ServiceRig rig;
+  {
+    Client c(rig.port());
+    c.send_all("POST /v1/chat/completions HTTP/1.1\r\nHost: t\r\n"
+               "Content-Type: application/json\r\nContent-Length: " +
+               std::to_string(chat_body("abcd", 3).size()) + "\r\n\r\n" + chat_body("abcd", 3));
+    require(c.read_until("usage", 5000).find("200 OK") != std::string::npos, "the completion ran");
+  }
+
+  // WHEN the exposition is read,
+  Client m(rig.port());
+  m.send_all("GET /metrics/prometheus HTTP/1.1\r\nHost: t\r\n\r\n");
+  const std::string r = m.read_until("dgpp_request_generation_tokens_count", 2000);
+
+  // THEN it is the text format: the route's original unlabeled lines
+  // intact, every family declared once, the counters typed and labeled
+  // with the model, and each distribution holding the request.
+  const std::string model = "model_name=\"" + kModel + "\"";
+  const auto has = [&](const std::string& line) { return r.find(line) != std::string::npos; };
+  require(r.find("HTTP/1.1 200 OK\r\n") == 0 && has("Content-Type: text/plain; version=0.0.4"),
+          "exposition content type: " + r.substr(0, 200));
+  for (const char* legacy : {"\nspec_decode_num_draft_tokens_total 0\n", "\nspec_decode_num_accepted_tokens_total 0\n",
+                             "\nspec_decode_num_drafts_total 0\n"})
+    require(has(legacy), std::string("legacy line kept: ") + legacy);
+  require(has("# TYPE dgpp_requests_total counter\n") && has("dgpp_requests_total{" + model + "} 1\n"),
+          "requests counter: " + r);
+  require(has("dgpp_request_finished_total{" + model + ",reason=\"length\"} 1\n"), "finish reason");
+  require(has("dgpp_generation_tokens_total{" + model + "} 3\n"), "generated tokens");
+  require(has("dgpp_build_info{" + model + ",version=\"\",git_sha=\"\",world_size=\"1\",admission=\"full\"} 1\n"),
+          "build info");
+  require(has("dgpp_max_concurrent_requests{" + model + "} 4\n"), "engine slots");
+  require(has("dgpp_num_requests_running{" + model + "} 0\n") && has("dgpp_num_requests_waiting{" + model + "} 0\n"),
+          "idle occupancy");
+  for (const char* h : {"dgpp_e2e_request_latency_seconds", "dgpp_request_queue_time_seconds",
+                        "dgpp_request_prefill_time_seconds", "dgpp_request_decode_time_seconds",
+                        "dgpp_request_time_per_output_token_seconds", "dgpp_request_prompt_tokens",
+                        "dgpp_request_generation_tokens"}) {
+    require(has(std::string(h) + "_count{" + model + "} 1\n"), std::string("one observation: ") + h);
+    require(has(std::string(h) + "_bucket{" + model + ",le=\"+Inf\"} 1\n"), std::string("+Inf bucket: ") + h);
+  }
+  require(has("dgpp_time_to_first_token_seconds_count{" + model + ",prefix_cache=\"miss\"} 1\n") &&
+              has("dgpp_time_to_first_token_seconds_count{" + model + ",prefix_cache=\"hit\"} 0\n"),
+          "TTFT split by attach");
+  require(has("dgpp_request_prompt_tokens_bucket{" + model + ",le=\"1\"} 0\n") &&
+              has("dgpp_request_prompt_tokens_bucket{" + model + ",le=\"8\"} 1\n") &&
+              has("dgpp_request_generation_tokens_sum{" + model + "} 3\n"),
+          "size buckets");
+  for (const char* family : {"dgpp_time_to_first_token_seconds", "dgpp_inter_token_latency_seconds",
+                             "dgpp_decode_step_duration_seconds", "dgpp_spec_decode_depth",
+                             "dgpp_decode_batch_replays_by_slots_total", "dgpp_prefix_cache_skipped_no_block_total"}) {
+    const std::string header = std::string("# TYPE ") + family + " ";
+    const size_t first = r.find(header);
+    require(first != std::string::npos && r.find(header, first + 1) == std::string::npos,
+            std::string("declared exactly once: ") + family);
+  }
+}
+
+DGPP_TEST(serve_interTokenMetrics_surviveRetirementBeforePassPublication) {
+  // The HTTP thread may finish a request while the engine thread is still
+  // in its retirement callback. Exercise that ordering deliberately, for
+  // one-token replies, scalar decode and several tokens from one MTP pass.
+  class BatchEngine : public FakeEngine {
+   public:
+    explicit BatchEngine(int batch) : FakeEngine(4, 100, 4), batch_(batch) {}
+    std::vector<int32_t> step(int req) override {
+      std::vector<int32_t> tokens;
+      for (int i = 0; i < batch_; ++i) tokens.push_back(FakeEngine::step(req).front());
+      return tokens;
+    }
+   private:
+    int batch_;
+  };
+  struct DrainOnRetire : dgpp::sched::SchedulerObserver {
+    GenerationService& service;
+    bool retired = false;
+    explicit DrainOnRetire(GenerationService& s) : service(s) {}
+    void on_token(const std::string&, int64_t, int) override {}
+    void on_retire(const std::string&, const dgpp::sched::Scheduler::Result&) override {
+      const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+      while (!service.drained() && std::chrono::steady_clock::now() < deadline)
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+      require(service.drained(), "HTTP removed the record before the engine pass completed");
+      retired = true;
+    }
+  };
+
+  for (const bool stream : {false, true}) {
+    for (const auto& [batch, tokens] : {std::pair{1, 1}, std::pair{1, 3}, std::pair{3, 7}}) {
+      BatchEngine engine(batch);
+      FakeFrontend frontend;
+      ServiceConfig cfg;
+      cfg.model_id = kModel;
+      cfg.vocab_size = 512;
+      GenerationService service(cfg, &engine, &frontend, {kFakeEos});
+      DrainOnRetire observer(service);
+      service.set_audit_observer(&observer);
+      HttpServer http(0, &service, 8);
+      std::thread http_loop([&] { http.serve(); });
+      struct Join {
+        HttpServer& http;
+        std::thread& loop;
+        ~Join() { http.stop(); loop.join(); }
+      } join{http, http_loop};
+      Client client(http.port());
+      post_completion(client, true, stream ? ",\"stream\":true" : "", tokens);
+      const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+      while (service.stats().requests_total == 0 && std::chrono::steady_clock::now() < deadline)
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+      require(service.stats().requests_total == 1, "request arrived before the first engine pass");
+      const uint64_t expected_gaps = static_cast<uint64_t>((tokens - 1) / batch);
+      const int passes = std::max(1, static_cast<int>(expected_gaps));
+      for (int pass = 0; pass < passes; ++pass) service.engine_pass();
+      require(observer.retired, "request retired in the expected number of passes");
+      const std::string response = client.read_until(stream ? "data: [DONE]" : "usage", 2000);
+      require(response.find("200 OK") != std::string::npos, "completion still succeeds");
+      const auto stats = service.stats();
+      require(stats.tokens_out == static_cast<uint64_t>(tokens), "generated token count is unchanged");
+      require(stats.itl_s.count() == expected_gaps,
+              "one latency observation per batch after the first token, including the retiring batch");
+      service.engine_pass();
+      require(service.stats().itl_s.count() == expected_gaps, "idle passes do not count the final batch twice");
+    }
+  }
+}
+
 DGPP_TEST(serve_decodeBatchMetrics_retainsLastLaunchWhileIdle) {
   ServiceRig rig;
   for (const bool reported : {false, true}) {
@@ -1435,6 +1568,149 @@ void expect_invalid_request(const std::string& resp, const std::string& param) {
   require(error.at("type").as_string() == "invalid_request_error",
           "invalid request error type: " + resp);
   require(error.at("param").as_string() == param, "error names " + param + ": " + resp);
+}
+
+std::string assistant_history_body(const std::string& messages) {
+  return "{\"model\":\"" + kModel + "\",\"max_tokens\":1,\"messages\":["
+         "{\"role\":\"user\",\"content\":\"hi\"}," + messages + "]}";
+}
+
+std::string assistant_history_globals(ServiceRig& rig, const std::string& messages) {
+  const auto response = post_chat(rig, assistant_history_body(messages), "usage");
+  require(response.find("200 OK") != std::string::npos,
+          "assistant history is accepted: " + response);
+  return rig.frontend.last_globals();
+}
+
+DGPP_TEST(serve_thinkingParts_preserveOwnedTextAndVisibleParts) {
+  ServiceRig rig;
+  // Force heap storage and retain the text past the per-message normalization
+  // loop. ASan catches using make_string on the local concatenation buffer.
+  const std::string thinking = std::string(2048, 'x') + " réfléchi 思考";
+  const std::string messages =
+      R"({"role":"assistant","content":[{"type":"thinking","thinking":)" +
+      json_of(dgpp::minijson::Value::make_string(thinking)) +
+      R"(,"signature":"signature_to_drop"},{"type":"text","text":"hello"},)"
+      R"({"type":"redacted_thinking","data":"opaque_to_drop"},)"
+      R"({"type":"thinking","thinking":""},{"type":"thinking","thinking":"second"},)"
+      R"({"type":"text","text":" world"}]},)"
+      R"({"role":"user","content":"again"},)"
+      R"({"role":"assistant","content":[{"type":"thinking","thinking":"independent"},)"
+      R"({"type":"text","text":"next"}]})";
+  const auto globals = assistant_history_globals(rig, messages);
+  const auto parsed = dgpp::minijson::parse(globals);
+  const auto& history = parsed.root.at("messages").items();
+  const auto& message = history[1];
+  require(message.at("reasoning_content").as_string() == thinking + "\n\nsecond",
+          "nonempty thinking parts join in order with their UTF-8 text intact");
+  const auto& content = message.at("content").items();
+  require(content.size() == 2 && content[0].at("type").as_string() == "text" &&
+              content[0].at("text").as_string() == "hello" &&
+              content[1].at("type").as_string() == "text" &&
+              content[1].at("text").as_string() == " world",
+          "visible text parts keep their order and contents");
+  require(history[3].at("reasoning_content").as_string() == "independent",
+          "each assistant message retains its own reasoning");
+  require(globals.find("opaque_to_drop") == std::string::npos &&
+              globals.find("signature_to_drop") == std::string::npos,
+          "redacted payloads and signatures do not reach the template");
+}
+
+DGPP_TEST(serve_thinkingParts_explicitReasoningWinsIncludingEmptyString) {
+  ServiceRig rig;
+  for (const auto& [field, expected] :
+       std::vector<std::pair<std::string, std::string>>{
+           {"", "folded"}, {R"(,"reasoning_content":null)", "folded"},
+           {R"(,"reasoning_content":"explicit")", "explicit"},
+           {R"(,"reasoning_content":"")", ""}}) {
+    const auto globals = assistant_history_globals(
+        rig, R"({"role":"assistant","content":[{"type":"thinking","thinking":"folded"},)"
+             R"({"type":"text","text":"answer"}])" + field + "}");
+    const auto parsed = dgpp::minijson::parse(globals);
+    const auto& message = parsed.root.at("messages").items()[1];
+    require(message.at("reasoning_content").as_string() == expected,
+            "explicit reasoning wins; absent or null reasoning uses thinking parts");
+    size_t count = 0;
+    for (const auto& member : message.members())
+      if (member.key == "reasoning_content") ++count;
+    require(count == 1, "normalization emits exactly one reasoning_content member");
+  }
+}
+
+DGPP_TEST(serve_thinkingParts_onlyThinkingHasEmptyVisibleContent) {
+  ServiceRig rig;
+  for (const std::string parts : {
+           R"([{"type":"thinking","thinking":"hmm"}])",
+           R"([{"type":"thinking","thinking":""}])",
+           R"([{"type":"redacted_thinking","data":"opaque"}])",
+           R"([{"type":"thinking","thinking":"hmm"},{"type":"redacted_thinking","data":"opaque"}])"}) {
+    const auto globals = assistant_history_globals(
+        rig, R"({"role":"assistant","content":)" + parts + "}");
+    const auto parsed = dgpp::minijson::parse(globals);
+    const auto& message = parsed.root.at("messages").items()[1];
+    require(message.at("content").is_string() && message.at("content").as_string().empty(),
+            "thinking-only history has an empty visible string");
+    const auto* reasoning = message.find("reasoning_content");
+    if (parts.find("hmm") != std::string::npos)
+      require(reasoning && reasoning->as_string() == "hmm", "thinking text is retained");
+    else
+      require(!reasoning, "empty or redacted thinking does not invent reasoning text");
+  }
+}
+
+DGPP_TEST(serve_thinkingParts_toolCallHistoryKeepsReasoningAndArguments) {
+  ServiceRig rig;
+  const auto globals = assistant_history_globals(
+      rig, R"({"role":"assistant","content":[{"type":"thinking","thinking":"use tool"}],)"
+           R"("tool_calls":[{"id":"call_1","type":"function","function":{"name":"get_weather",)"
+           R"("arguments":"{\"city\":\"Paris\"}"}}]},)"
+           R"({"role":"tool","tool_call_id":"call_1","content":"18C"})");
+  const auto parsed = dgpp::minijson::parse(globals);
+  const auto& history = parsed.root.at("messages").items();
+  const auto& message = history[1];
+  require(message.at("content").is_string() && message.at("content").as_string().empty(),
+          "a tool call with only thinking has empty visible content");
+  require(message.at("reasoning_content").as_string() == "use tool",
+          "tool-call reasoning reaches the template");
+  const auto& call = message.at("tool_calls").items()[0];
+  require(call.at("id").as_string() == "call_1" &&
+              call.at("function").at("name").as_string() == "get_weather" &&
+              call.at("function").at("arguments").at("city").as_string() == "Paris",
+          "tool-call IDs and names survive and string arguments become an object");
+  require(history[2].at("tool_call_id").as_string() == "call_1" &&
+              history[2].at("content").as_string() == "18C",
+          "the matching tool result is preserved");
+}
+
+DGPP_TEST(serve_thinkingParts_invalidFieldsAndOtherRolesStillRejected) {
+  ServiceRig rig;
+  const auto refused = [&](const std::string& messages, const std::string& param) {
+    expect_invalid_request(
+        post_chat(rig, assistant_history_body(messages), "\"error\""), param);
+  };
+  for (const std::string value : {"null", "false", "7", "[]", "{}"}) {
+    for (const std::string reasoning : {"", R"(,"reasoning_content":"explicit")"}) {
+      refused(R"({"role":"assistant","content":[{"type":"thinking","thinking":)" +
+                  value + "}]" + reasoning + "}",
+              "messages[1].content[0].thinking");
+    }
+  }
+  for (const std::string role : {"user", "system", "developer", "tool"}) {
+    for (const std::string kind : {"thinking", "redacted_thinking"}) {
+      refused("{\"role\":\"" + role + "\",\"tool_call_id\":\"call_1\",\"content\":["
+              "{\"type\":\"" + kind + "\",\"thinking\":\"hmm\"}]}",
+              role == "tool" ? "messages[1].content" : "messages[1].content[0].type");
+    }
+  }
+  for (const std::string kind : {"thinking", "redacted_thinking"}) {
+    refused(R"({"role":"assistant","content":[{"type":")" + kind +
+                R"(","thinking":"hmm","prompt_cache_breakpoint":true}]})",
+            "messages[1].content[0].prompt_cache_breakpoint");
+  }
+  refused(R"({"role":"assistant","content":[{"type":"thinking","thinking":"hmm"},)"
+          R"({"type":"audio"}]})", "messages[1].content[1].type");
+  refused(R"({"role":"assistant","content":[{"type":"thinking","thinking":"hmm"}],)"
+          R"("reasoning_content":123})", "messages[1].reasoning_content");
 }
 
 DGPP_TEST(serve_api_nullableFieldsAndTextCapabilities) {
@@ -2062,6 +2338,48 @@ DGPP_TEST(serve_tools_dsmlNamespacesMatchRenderedAndConstrainedNames) {
               "the namespace description reaches the model: " + prompt);
       require(globals.find("response_schema_marker") == std::string::npos,
               "DeepSeek still drops unrelated tool fields: " + globals);
+    }
+  }
+}
+
+// The DeepSeek-V4 dialect of DSML has no tool namespaces: a `namespace`
+// field is unrelated metadata there (dropped like any other), the grammar
+// names the function as given, and the rendered schema agrees with it.
+DGPP_TEST(serve_tools_dsmlV4DialectHasNoNamespaces) {
+  ServiceRig rig(8, dgpp::sample::greedy_params(), true, std::nullopt, true, false, {}, 0, {},
+                 std::nullopt, 0, 0, /*resumable_prefill=*/false, /*with_dsml=*/true, "{}",
+                 dgpp::serve::kDefaultSsePingInterval, dgpp::text::DsmlDialect::kV4);
+  const std::string ns = R"("namespace":{"name":"search","description":"Search tools"})";
+  const std::string fields =
+      R"("name":"lookup","description":"Lookup","parameters":{"type":"object","properties":{}},"response":{"response_schema_marker":true})";
+  size_t expected_grammars = 0;
+  for (const std::string& tool :
+       {"{\"type\":\"function\"," + ns + ",\"function\":{" + fields + "}}",
+        "{\"type\":\"function\",\"function\":{" + ns + "," + fields + "}}",
+        "{" + ns + "," + fields + "}",
+        "{\"type\":\"function\",\"function\":{" + fields + "}}"}) {
+    for (const std::string& choice :
+         {std::string{R"(,"tool_choice":"required")"},
+          std::string{R"(,"tool_choice":{"type":"function","function":{"name":"lookup"}})"}}) {
+      const auto response =
+          post_until_usage(rig, chat_body("abcd", 2, ",\"tools\":[" + tool + "]" + choice));
+      require(response.find("200 OK") != std::string::npos, "tools accepted: " + response);
+      const std::string globals = rig.frontend.last_globals();
+      require(globals.find("namespace") == std::string::npos && globals.find("response_schema_marker") == std::string::npos,
+              "the V4 dialect drops namespaces with the other unrelated tool fields: " + globals);
+      const auto parsed = dgpp::minijson::parse(globals);
+      const std::string prompt = dgpp::text::Dsv4Prompt::render(parsed.root);
+      const auto grammars = rig.engine.grammars();
+      require(grammars.size() == ++expected_grammars, "each request installs a constraint");
+      const auto& grammar = grammars.back();
+      require(grammar.tools.size() == 1 && grammar.tools[0].name == "lookup", "the grammar names the function as given");
+      if (grammar.mode == dgpp::text::GrammarSpec::Mode::kNamed)
+        require(grammar.named == "lookup", "a named choice names the same function");
+      require(prompt.find("{\"name\": \"lookup\", \"description\": \"Lookup\", \"parameters\": {\"type\": \"object\", \"properties\": {}}}") !=
+                  std::string::npos,
+              "the rendered schema is the function as given, agreeing with the constraint: " + prompt);
+      require(prompt.find("<｜DSML｜tool_calls>") != std::string::npos && prompt.find("<｜DSML｜ calls>") == std::string::npos,
+              "the tools block teaches the V4 spelling");
     }
   }
 }

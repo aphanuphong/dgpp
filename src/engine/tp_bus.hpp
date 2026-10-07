@@ -248,7 +248,31 @@ class BusStreamReducer final : public BoundaryReducer {
       throw std::runtime_error("boundary settle: " + err);
   }
 
+  // The fold overlap (2026-10-02, the DeepSeek-V4-Flash prefill): a
+  // prefill-class fold submitted to the bulk machine without its wait —
+  // the stream's folds settled and the stream drained first, as reduce()
+  // does — so the model runs OTHER rows on its stream meanwhile.
+  bool begin_async(uint16_t* partial, int rows, int hidden) override {
+    const size_t total = static_cast<size_t>(rows > 0 ? rows : 0) * static_cast<size_t>(hidden > 0 ? hidden : 0);
+    if (stream_ == nullptr || async_id_ != 0 || hidden <= 0 || hidden % 2 != 0 || total <= max_elems_) return false;
+    settle();
+    DGPP_CUDA_OK(cudaStreamSynchronize(stream_));
+    std::string err;
+    async_id_ = bus_.allreduce_bulk(partial, partial, total, &err);
+    if (async_id_ == 0) throw std::runtime_error("boundary reduce: bulk rejected: " + err);
+    return true;
+  }
+  void end_async() override {
+    if (async_id_ == 0) return;
+    step_timing::Scope tick(step_timing::kFold);
+    const uint64_t id = async_id_;
+    async_id_ = 0;
+    const net::BusAllReduceResult res = bus_.wait_allreduce(id, timeout_ms_);
+    if (!res.ok) throw std::runtime_error("boundary bulk (async): " + res.error);
+  }
+
  private:
+  uint64_t async_id_ = 0;
   void issue(uint16_t* at, size_t elems) {
     std::string err;
     if (bus_.allreduce_stream(stream_, at, at, elems, &err) == 0)
@@ -1199,6 +1223,10 @@ class DevicePicker {
     DraftProposal* proposals_out = nullptr;
     DraftProposal* proposals_out_host = nullptr;
     int draft_index = 0;
+    // The sampled chain's rule (2026-10-05): 1 = block verification
+    // (sample::block_verify, the whole block decided jointly), 0 = the
+    // token-by-token test. Baked into the captured verdict node.
+    int block_verify = 0;
   };
   bool sampling() const { return candidates_ > 0; }
   int sampling_candidates() const { return candidates_; }
@@ -1415,7 +1443,8 @@ class DevicePicker {
                           position_stride(in), in.counts, in.masks, in.mask_stride,
                           verdict_slot(in.slot), device_verdict_slot(in.slot),
                           outcomes_ + in.slot * kPickMaxRequests, carry_, stream, in.proposals_in,
-                          in.proposals_out, in.proposals_out_host, in.draft_index, in.request_map);
+                          in.proposals_out, in.proposals_out_host, in.draft_index, in.request_map,
+                          in.block_verify);
   }
 
   net::CollectiveBus& bus_;

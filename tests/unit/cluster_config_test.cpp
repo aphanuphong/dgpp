@@ -93,25 +93,73 @@ DGPP_TEST(cluster_config_parses_fills_defaults_and_derives_the_world) {
     "nodes": ["10.0.0.1", "10.0.0.2", "10.0.0.3"],
     "ssh_user": "ops",
     "release": "0.1.0+gabc",
-    "ports": {"http": 8081, "journal": 29001},
+    "ports": {"http": 8081, "journal": 29001, "metrics": 29002},
     "engine": {"max_concurrency": 2, "decode_graph": true, "prefix_cache_gib": 0.5,
                "admission": "grow", "stats_interval_s": 0, "mtp_depth": 2, "prefill": "exact",
                "prefill_budget_tokens": 256, "prefill_idle_budget_tokens": 2048,
-               "prefix_min_tokens": 512, "prefix_head_snapshots": false},
+               "prefix_min_tokens": 512, "prefix_head_snapshots": false, "mtp_draft": "greedy",
+               "mtp_schedule_sampled_scale": 0.5, "mtp_draft_temperature": 0.7, "mtp_verify": "block",
+               "dflash_batch_rows": 32, "dflash_weights": "fp8", "prefill_group": false,
+               "l2_prefetch": false, "l2_prefetch_form": "touch", "l2_prefetch_window_mib": 8,
+               "l2_prefetch_boundary_window_mib": 0, "l2_prefetch_boundary_rate": "full",
+               "l2_prefetch_layer_rate": "off", "l2_prefetch_merge": false},
     "paths": {"log_dir": "/var/log/dgpp"}
   })";
   const dgpp::serve::ClusterConfig c = dgpp::serve::parse_cluster_config(json, "t");
   require(c.model == "org/name" && c.world() == 3 && c.nodes[0] == "10.0.0.1" &&
               c.nodes[2] == "10.0.0.3" && c.ssh_user == "ops" && c.release == "0.1.0+gabc",
           "the model, the nodes, the user and the release");
-  require(c.http_port == 8081 && c.fabric_port == 29970 && c.journal_port == 29001,
+  require(c.http_port == 8081 && c.fabric_port == 29970 && c.journal_port == 29001 && c.metrics_port == 29002,
           "the ports: given ones taken, the fabric port defaulted");
+  require(dgpp::serve::parse_cluster_config(R"({"model":"m","nodes":["h"]})", "t").metrics_port == 0,
+          "the peers' metrics listener is off by default");
   require(c.engine.max_concurrency == 2 && c.engine.decode_graph && !c.engine.mtp &&
               c.engine.mtp_depth == 2 && c.engine.prefix_cache_gib == 0.5 &&
               c.engine.admission == "grow" && c.engine.stats_interval_s == 0.0 && c.engine.prefill == "exact" &&
               c.engine.prefill_budget_tokens == 256 && c.engine.prefill_idle_budget_tokens == 2048 &&
-              c.engine.prefix_min_tokens == 512 && !c.engine.prefix_head_snapshots,
+              c.engine.prefix_min_tokens == 512 && !c.engine.prefix_head_snapshots &&
+              c.engine.mtp_draft == "greedy" && c.engine.mtp_schedule_sampled_scale == 0.5 &&
+              c.engine.mtp_draft_temperature == 0.7 && c.engine.mtp_verify == "block" &&
+              c.engine.dflash_batch_rows == 32 && c.engine.dflash_weights == "fp8" && !c.engine.prefill_group &&
+              !c.engine.l2_prefetch && c.engine.l2_prefetch_form == "touch" && c.engine.l2_prefetch_window_mib == 8 &&
+              c.engine.l2_prefetch_boundary_window_mib == 0 && c.engine.l2_prefetch_boundary_rate == "full" &&
+              c.engine.l2_prefetch_layer_rate == "off" && !c.engine.l2_prefetch_merge,
           "the given engine knobs");
+  {
+    const dgpp::serve::ClusterConfig d = dgpp::serve::parse_cluster_config(R"({"model":"m","nodes":["h"]})", "t");
+    require(d.engine.l2_prefetch && d.engine.l2_prefetch_form == "load" && d.engine.l2_prefetch_window_mib == 12 &&
+                d.engine.l2_prefetch_boundary_window_mib == 20 && d.engine.l2_prefetch_boundary_rate == "light" &&
+                d.engine.l2_prefetch_layer_rate == "light" && d.engine.l2_prefetch_merge,
+            "the L2 prefetcher's defaults");
+  }
+  require(dgpp::serve::parse_cluster_config(R"({"model":"m","nodes":["h"]})", "t").engine.prefill_group,
+          "cold prompts group by default");
+  require(dgpp::serve::parse_cluster_config(R"({"model":"m","nodes":["h"]})", "t").engine.dflash_weights == "checkpoint",
+          "the drafter serves its checkpoint's weights by default");
+  require(dgpp::serve::parse_cluster_config(R"({"model":"m","nodes":["h"]})", "t").engine.dflash_batch_rows == 0,
+          "the drafter's batches verify whole blocks by default");
+  require(dgpp::serve::parse_cluster_config(R"({"model":"m","nodes":["h"]})", "t").engine.mtp_verify == "token",
+          "the sampled chain's rule defaults to the token test");
+  require(dgpp::serve::parse_cluster_config(R"({"model":"m","nodes":["h"]})", "t").engine.mtp_draft_temperature == 1.0,
+          "the drawn drafts' temperature defaults to the request's");
+  require(dgpp::serve::parse_cluster_config(R"({"model":"m","nodes":["h"]})", "t").engine.mtp_schedule_sampled_scale == 0.93,
+          "the sampled requests' schedule scale defaults to the measured 0.93");
+  require(dgpp::serve::parse_cluster_config(R"({"model":"m","nodes":["h"]})", "t").engine.mtp_draft == "auto",
+          "the sampled requests' draft rule defaults to the family's");
+  // The idle engine's arrival gather: 3 ms by default, 0 disables, bounded.
+  require(c.engine.admission_gather_ms == 3, "the arrival gather defaults to 3 ms");
+  require(dgpp::serve::parse_cluster_config(R"({"model":"m","nodes":["h"],"engine":{"admission_gather_ms":0}})", "t")
+                  .engine.admission_gather_ms == 0,
+          "the arrival gather can be turned off");
+  {
+    bool rejected = false;
+    try {
+      (void)dgpp::serve::parse_cluster_config(R"({"model":"m","nodes":["h"],"engine":{"admission_gather_ms":5000}})", "t");
+    } catch (const std::exception&) {
+      rejected = true;
+    }
+    require(rejected, "an arrival gather past one second is refused");
+  }
   // The engine defaults are the binary's flag defaults — one set of defaults.
   require(c.engine.kv_capacity == 8192 && c.engine.default_max_tokens == 256 &&
               c.engine.queue_limit == 64 && c.engine.max_connections == 64 &&
@@ -121,7 +169,9 @@ DGPP_TEST(cluster_config_parses_fills_defaults_and_derives_the_world) {
               c.engine.rendezvous_timeout_ms == 120000 && !c.engine.reasoning_in_content &&
               c.engine.kv_dtype == "bf16" && c.engine.bf16_weights == "checkpoint" &&
               c.engine.fp8_head == "gemv" && !c.engine.prefill_bf16_partials && !c.engine.prefill_fold_scales &&
-              !c.engine.prefill_fp8_gemm && c.engine.expert_gemm == "wide" && c.engine.expert_gemm_prefetch == 3 &&
+              !c.engine.prefill_fp8_gemm && !c.engine.prefill_fp8_per_tensor && c.engine.dflash_model.empty() &&
+              c.engine.dflash_verify_graph && c.engine.dflash_draft_batch && c.engine.dflash_depth == 0 &&
+              c.engine.expert_gemm == "wide" && c.engine.expert_gemm_prefetch == 3 &&
               c.engine.expert_tile_list && !c.engine.expert_gemm_pair && c.engine.ngram_prestage,
           "the engine defaults");
   // The expert GEMM's form and companions (2026-09-30): keys, not environment switches.
@@ -132,16 +182,24 @@ DGPP_TEST(cluster_config_parses_fills_defaults_and_derives_the_world) {
               xg.engine.expert_gemm_pair && !xg.engine.ngram_prestage,
           "the expert GEMM keys parse");
   // The opt-in prefill levers (2026-09-30): off unless the config says so.
-  for (const std::string key : {"prefill_bf16_partials", "prefill_fold_scales", "prefill_fp8_gemm"}) {
+  for (const std::string key : {"prefill_bf16_partials", "prefill_fold_scales", "prefill_fp8_gemm",
+                                "prefill_fp8_per_tensor"}) {
     const auto on = dgpp::serve::parse_cluster_config(
         R"({"model":"m","nodes":["h"],"engine":{")" + key + R"(":true}})", "t");
     const bool got = key == "prefill_bf16_partials" ? on.engine.prefill_bf16_partials
                      : key == "prefill_fold_scales"  ? on.engine.prefill_fold_scales
-                                                     : on.engine.prefill_fp8_gemm;
+                     : key == "prefill_fp8_gemm"     ? on.engine.prefill_fp8_gemm
+                                                     : on.engine.prefill_fp8_per_tensor;
     const int others = (on.engine.prefill_bf16_partials ? 1 : 0) + (on.engine.prefill_fold_scales ? 1 : 0) +
-                       (on.engine.prefill_fp8_gemm ? 1 : 0);
+                       (on.engine.prefill_fp8_gemm ? 1 : 0) + (on.engine.prefill_fp8_per_tensor ? 1 : 0);
     require(got && others == 1, "engine." + key + " opt-in alone");
   }
+  // The DFlash2 drafter's keys (2026-10-03).
+  const auto df = dgpp::serve::parse_cluster_config(
+      R"({"model":"m","nodes":["h"],"engine":{"dflash_model":"z-lab/Qwen3.8-27B-DFlash2","dflash_verify_graph":false,"dflash_draft_batch":false,"dflash_depth":4}})", "t");
+  require(df.engine.dflash_model == "z-lab/Qwen3.8-27B-DFlash2" && !df.engine.dflash_verify_graph &&
+              !df.engine.dflash_draft_batch && df.engine.dflash_depth == 4,
+          "the dflash keys parse");
   const auto compact = dgpp::serve::parse_cluster_config(
       R"({"model":"m","nodes":["h"],"engine":{"compact_batches":true}})", "t");
   require(compact.engine.compact_batches, "compact_batches opt-in");
@@ -291,8 +349,26 @@ DGPP_TEST(cluster_config_refusesUnknownKeysAndBadValuesByName) {
        "'engine.mtp' must be true or false"},
       {R"({"model":"m","nodes":["h"],"engine":{"mtp_depth":6}})",
        "'engine.mtp_depth' must be in [1, 5]"},
+      {R"({"model":"m","nodes":["h"],"engine":{"dflash_depth":8}})",
+       "'engine.dflash_depth' must be in [0, 7]"},
+      {R"({"model":"m","nodes":["h"],"engine":{"dflash_verify_graph":"yes"}})",
+       "'engine.dflash_verify_graph' must be true or false"},
       {R"({"model":"m","nodes":["h"],"engine":{"mtp_depth":0}})",
        "'engine.mtp_depth' must be in [1, 5]"},
+      {R"({"model":"m","nodes":["h"],"engine":{"mtp_draft":"beam"}})",
+       "'engine.mtp_draft' must be auto, sampled or greedy"},
+      {R"({"model":"m","nodes":["h"],"engine":{"mtp_draft_temperature":0}})",
+       "'engine.mtp_draft_temperature' must be in (0, 4]"},
+      {R"({"model":"m","nodes":["h"],"engine":{"mtp_verify":"tree"}})",
+       "'engine.mtp_verify' must be token or block"},
+      {R"({"model":"m","nodes":["h"],"engine":{"dflash_weights":"nvfp4"}})",
+       "'engine.dflash_weights' must be checkpoint or fp8"},
+      {R"({"model":"m","nodes":["h"],"engine":{"l2_prefetch_layer_rate":"heavy"}})",
+       "'engine.l2_prefetch_layer_rate' must be off, light or full"},
+      {R"({"model":"m","nodes":["h"],"engine":{"l2_prefetch_form":"walk"}})",
+       "'engine.l2_prefetch_form' must be load, lines or touch"},
+      {R"({"model":"m","nodes":["h"],"engine":{"mtp_schedule_sampled_scale":1.5}})",
+       "'engine.mtp_schedule_sampled_scale' must be in [0, 1]"},
       {R"({"model":"m","nodes":["h"],"engine":{"admission":"fast"}})",
        "'engine.admission' must be \"full\" or \"grow\""},
       {R"({"model":"m","nodes":["h"],"engine":{"prefix_cache_gib":-1}})",
@@ -341,6 +417,10 @@ DGPP_TEST(cluster_config_refusesUnknownKeysAndBadValuesByName) {
        "http.max_body_bytes"},
       {R"({"model":"m","nodes":["h"],"ports":{"fabric":5,"journal":5}})",
        "'ports.fabric' and 'ports.journal' must differ"},
+      {R"({"model":"m","nodes":["h"],"ports":{"metrics":70000}})",
+       "'ports.metrics' must be in [0, 65535]"},
+      {R"({"model":"m","nodes":["h"],"ports":{"metrics":29970}})",
+       "'ports.metrics' must differ from 'ports.fabric' and 'ports.journal'"},
       {R"({"model":"m","nodes":["h"],"paths":{"logs":"/x"}})", "unknown key 'paths.logs'"},
       {R"({"model":"m","nodes":["h"],"paths":{"log_dir":3}})", "'paths.log_dir' must be a string"},
       {R"({"model":"m","nodes":["h"],)", "invalid JSON"},

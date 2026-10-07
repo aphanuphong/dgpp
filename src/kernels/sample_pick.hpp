@@ -66,7 +66,7 @@ struct SampleSpec {
   uint64_t counter = 0;
   // The DRAFT's temperature: the proposal is the draft head's
   // final set at THIS temperature, the request's own scaled by
-  // DGPP_SPEC_PROPOSAL_TEMP (0 = the request's). Any proposal is exact;
+  // engine.mtp_draft_temperature (0 = the request's). Any proposal is exact;
   // the scale only moves the overlap with P, i.e. the acceptance rate.
   float draft_temperature = 0.0f;
 };
@@ -79,14 +79,30 @@ struct SampleSpec {
 // untouched), and it carries no state of its own to keep in step across a
 // fallback's push.
 constexpr uint64_t kSampleDraftSeedMix = 0x9E3779B97F4A7C15ull;
+// The draw primitives (sample::uniform01's arithmetic): splitmix64 and the
+// top 53 bits of splitmix64(splitmix64(counter) ^ seed) as an fp64 in
+// [0, 1) — the verdict's draws, the draft pick's, and the DFlash2 sampled
+// walk's (kernels/dflash2.hpp), host-callable for the gates.
+__host__ __device__ inline uint64_t splitmix64(uint64_t x) {
+  x += 0x9e3779b97f4a7c15ull;
+  x = (x ^ (x >> 30)) * 0xbf58476d1ce4e5b9ull;
+  x = (x ^ (x >> 27)) * 0x94d049bb133111ebull;
+  return x ^ (x >> 31);
+}
+__host__ __device__ inline double uniform01(uint64_t seed, uint64_t counter) {
+  const uint64_t draw = splitmix64(splitmix64(counter) ^ seed);
+  return static_cast<double>(draw >> 11) * (1.0 / 9007199254740992.0);
+}
 
 constexpr int kSampleMaxTopLogprobs = 20;
 
 // The verify rows a sampled verdict decides over: the fed token's row plus
 // up to kSampleVerdictRows - 1 drafts — the families' kSpecRows (6 since
 // the DeepSeek-V4.1 DSpark block of five drafts, 2026-09-14; the kernel's
-// per-row tables moved to dynamic shared memory for it).
-constexpr int kSampleVerdictRows = 6;
+// per-row tables moved to dynamic shared memory for it; 8 since the
+// DFlash2 block of seven drafts on the graph worlds, 2026-10-04 — the
+// dynamic tables reach ~63 KB of the GB10's 99 KB per block).
+constexpr int kSampleVerdictRows = 8;
 
 // The sampling verdict's outcome per request, beside the PickVerdict the
 // device consumers (commit, token feeds) keep reading.
@@ -99,6 +115,11 @@ struct SampleOutcome {
   int32_t fallback_row = -1;  // which row fell back (0..rows-1), -1 none
   int32_t accepted_draft = 0; // T>=2: the first draft stood (provisional 0
                               // on a row-0 fallback)
+  // Block verification (2026-10-05, sample::block_verify): 1 when the block
+  // rule decided the chain; a fallback at row tau < gamma then needs the
+  // host to draw the block residual (p_tau * P - Q)+ with this p_tau.
+  int32_t block = 0;
+  double block_p = 1.0;
   // Per verify row t (2026-09-06, T = 1 + drafts): the fold log-sum-exp,
   // the prefix mass under it (rows the device decided over) and the
   // outcome's log-probability. Rows the chain never reached stay zero.
@@ -261,7 +282,7 @@ void device_sample_verdict(const uint16_t* table, int rows, int world, int rank,
                            const DraftProposal* proposals_in = nullptr,
                            DraftProposal* proposals_out = nullptr,
                            DraftProposal* proposals_out_host = nullptr, int draft_index = 0,
-                           const int32_t* request_map = nullptr);
+                           const int32_t* request_map = nullptr, int block_verify = 0);
 
 // counts[token] += delta (the host's correction of a request's context after
 // a fallback it decided: a provisionally rejected draft joins the table

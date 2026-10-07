@@ -132,6 +132,12 @@ class SchedulerEngine {
     int depth = 0;
     uint64_t attempts[8] = {};
     uint64_t accepts[8] = {};
+    // A block drafter's first rejected draft, ranked among the candidates
+    // its walk scored at that position (2026-10-05, the tree-verify
+    // sizing): miss_rank[r] counts corrections that were the drafter's
+    // (r+1)-th candidate, miss_rank[kMissRanks] those outside the list.
+    static constexpr int kMissRanks = 16;
+    uint64_t miss_rank[kMissRanks + 1] = {};
   };
   // Last launched decode graph, retained while idle; counters since startup.
   struct DecodeBatchStats {
@@ -229,15 +235,23 @@ class SchedulerEngine {
   virtual PrefixInfo prefix_info() const { return {}; }
   // The hop (M7 under a multi-token step): the request's next step may
   // commit past `position` (= its committed count + 1, pool-aligned) without
-  // stopping there; if it commits two tokens, the engine takes the state
+  // stopping there; if it commits two tokens, the engine attempts to save the state
   // after the step's first row — the state at `position` — into arena slot
-  // `slot` before returning from that step. A one-token step lands ON the
+  // `slot` before returning from that step (check prefix_position afterwards).
+  // A one-token step lands ON the
   // position and the scheduler's rolling snapshot follows at the next tick.
   // The arm holds until the slot's next step (or its close).
   virtual void prefix_arm_hop(int req, int slot, int64_t position) {
     (void)req;
     (void)slot;
     (void)position;
+  }
+  // The position actually stored in an arena slot, or -1 if it is empty.
+  // A multi-token step may skip its armed hop when the cache pool is full;
+  // token acceptance alone does not establish that the snapshot was taken.
+  virtual int64_t prefix_position(int slot) const {
+    (void)slot;
+    throw std::logic_error("SchedulerEngine: this engine has no prefix cache");
   }
   // The prefill with the cache: `boundaries` (absolute positions, ascending)
   // are the request's structural cut positions — the cold chunking cuts at
@@ -281,6 +295,19 @@ class SchedulerEngine {
   // retains it. Implementations must report work within the selected budget.
   virtual PrefillProgress advance_prefill(int, int64_t = 0) {
     throw std::logic_error("SchedulerEngine: resumable prefill is unavailable");
+  }
+  // Several in-flight prefills' next chunks, request i within budgets[i] tokens.
+  // An engine with prefill_group_advance() runs them as ONE physical walk
+  // (the weights stream once for all of them) — the scheduler then reads
+  // every prompt past one aligned chunk in through its cursor and begins
+  // as many per tick as the budget has aligned shares, so prompts that
+  // arrive together are read in together. The default advances one by one.
+  virtual bool prefill_group_advance() const { return false; }
+  virtual std::vector<PrefillProgress> advance_prefill_group(const std::vector<int>& reqs,
+                                                             const std::vector<int64_t>& budgets) {
+    std::vector<PrefillProgress> out;
+    for (size_t i = 0; i < reqs.size(); ++i) out.push_back(advance_prefill(reqs[i], budgets.at(i)));
+    return out;
   }
   virtual int32_t prefill_cached(int req, const std::vector<int64_t>& prompt,
                                  PrefixPrefill* plan) {
@@ -704,6 +731,8 @@ class Scheduler {
   void admit(int arrival);
   void begin_prefill(int arrival, int64_t budget);
   void advance_prefill(int arrival, int64_t budget);
+  void advance_prefill_group(const std::vector<int>& arrivals, const std::vector<int64_t>& budgets);
+  void apply_prefill_progress(int arrival, const SchedulerEngine::PrefillProgress& progress, int64_t budget, double ms);
   // The chunked-prefill predicate behind the admit dispatch: a positive
   // budget, chunkable inputs (plain text, or images on an engine that
   // chunks them), and a prompt longer than one tick's budget.
@@ -794,6 +823,13 @@ class SchedulerObserver {
     (void)id;
     (void)steps_done;
     (void)logprobs;
+  }
+  // The request left the queue for an engine slot and its prefill begins
+  // (every admission path, grouped prefills included). Timing only: the
+  // op stream does not record it. Default: ignored.
+  virtual void on_admit(const std::string& id, int slot) {
+    (void)id;
+    (void)slot;
   }
   // The request's terminal state, exactly once (EOS, steps cap,
   // scripted or external cancellation, pool exhaustion all land here).

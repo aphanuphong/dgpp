@@ -146,12 +146,11 @@ ClusterConfig parse_cluster_config(const std::string& json, const std::string& w
         if (!node.is_object()) fail(what, "'node_env[]' must be an object");
         std::map<std::string, std::string> env;
         // The launcher's NODE_KEYS (scripts/site_env.py): the fabric's per-node
-        // settings and the L2 weight-prefetch knobs (src/kernels/l2_prefetch.hpp),
-        // which an A/B sets the same way on every rank.
+        // settings (the L2 weight prefetcher's knobs are engine.l2_prefetch*
+        // keys since 2026-10-05).
         static const char* const kNodeKeys[] = {
             "DGPP_ROCE_DEVICES", "DGPP_ROCE_GID_INDICES", "HF_HUB_CACHE", "DGPP_RESIDENT_CACHE_DIR",
             "DGPP_LOG_LEVEL", "DGPP_MLOCK",
-            "DGPP_L2_PREFETCH", "DGPP_L2_PREFETCH_MB", "DGPP_L2_PREFETCH_BOUNDARY", "DGPP_L2_PREFETCH_LAYER",
             // The bus timeline switch and the dense-lowering A/B switches: every rank the same.
             "DGPP_BUS_TIMELINE", "DGPP_DSV41_DENSE_GEMV", "DGPP_DENSE_GEMV_ROWS", "DGPP_DSV41_EAGER_FOLD"};
         for (const Member& setting : node.members()) {
@@ -169,6 +168,7 @@ ClusterConfig parse_cluster_config(const std::string& json, const std::string& w
         if (p.key == "http") c.http_port = static_cast<int>(integer(p.value, pk, what, 1, 65535));
         else if (p.key == "fabric") c.fabric_port = static_cast<int>(integer(p.value, pk, what, 1, 65535));
         else if (p.key == "journal") c.journal_port = static_cast<int>(integer(p.value, pk, what, 1, 65535));
+        else if (p.key == "metrics") c.metrics_port = static_cast<int>(integer(p.value, pk, what, 0, 65535));
         else fail(what, "unknown key '" + pk + "'");
       }
     } else if (k == "engine") {
@@ -226,6 +226,8 @@ ClusterConfig parse_cluster_config(const std::string& json, const std::string& w
           e.prefill_fold_scales = boolean(x, ek, what);
         } else if (p.key == "prefill_fp8_gemm") {
           e.prefill_fp8_gemm = boolean(x, ek, what);
+        } else if (p.key == "prefill_fp8_per_tensor") {
+          e.prefill_fp8_per_tensor = boolean(x, ek, what);
         } else if (p.key == "expert_gemm") {
           e.expert_gemm = text(x, ek, what);
           if (e.expert_gemm != "wide" && e.expert_gemm != "wide3" && e.expert_gemm != "wide4" &&
@@ -300,12 +302,38 @@ ClusterConfig parse_cluster_config(const std::string& json, const std::string& w
           }
         }
         else if (p.key == "queue_limit") e.queue_limit = static_cast<int>(integer(x, ek, what, 1, 1 << 30));
+        else if (p.key == "admission_gather_ms") e.admission_gather_ms = static_cast<int>(integer(x, ek, what, 0, 1000));
         else if (p.key == "max_connections") e.max_connections = static_cast<int>(integer(x, ek, what, 1, 1 << 20));
         else if (p.key == "no_eos") e.no_eos = boolean(x, ek, what);
         else if (p.key == "decode_graph") e.decode_graph = boolean(x, ek, what);
         else if (p.key == "mtp") e.mtp = boolean(x, ek, what);
+        else if (p.key == "dflash_model") e.dflash_model = text(x, ek, what);
+        else if (p.key == "dflash_weights") {
+          e.dflash_weights = text(x, ek, what);
+          if (e.dflash_weights != "checkpoint" && e.dflash_weights != "fp8")
+            fail(what, "'" + ek + "' must be checkpoint or fp8");
+        }
+        else if (p.key == "dflash_verify_graph") e.dflash_verify_graph = boolean(x, ek, what);
+        else if (p.key == "prefill_group") e.prefill_group = boolean(x, ek, what);
+        else if (p.key == "l2_prefetch") e.l2_prefetch = boolean(x, ek, what);
+        else if (p.key == "l2_prefetch_form") {
+          e.l2_prefetch_form = text(x, ek, what);
+          if (e.l2_prefetch_form != "load" && e.l2_prefetch_form != "lines" && e.l2_prefetch_form != "touch")
+            fail(what, "'" + ek + "' must be load, lines or touch");
+        }
+        else if (p.key == "l2_prefetch_window_mib") e.l2_prefetch_window_mib = static_cast<int>(integer(x, ek, what, 1, 64));
+        else if (p.key == "l2_prefetch_boundary_window_mib")
+          e.l2_prefetch_boundary_window_mib = static_cast<int>(integer(x, ek, what, 0, 64));
+        else if (p.key == "l2_prefetch_boundary_rate" || p.key == "l2_prefetch_layer_rate") {
+          const std::string r = text(x, ek, what);
+          if (r != "off" && r != "light" && r != "full") fail(what, "'" + ek + "' must be off, light or full");
+          (p.key == "l2_prefetch_boundary_rate" ? e.l2_prefetch_boundary_rate : e.l2_prefetch_layer_rate) = r;
+        }
+        else if (p.key == "l2_prefetch_merge") e.l2_prefetch_merge = boolean(x, ek, what);
+        else if (p.key == "dflash_draft_batch") e.dflash_draft_batch = boolean(x, ek, what);
+        else if (p.key == "dflash_depth") e.dflash_depth = static_cast<int>(integer(x, ek, what, 0, 7));
         else if (p.key == "mtp_depth") {
-          e.mtp_depth = static_cast<int>(integer(x, ek, what, 1, 5));  // kSpecRows - 1
+          e.mtp_depth = static_cast<int>(integer(x, ek, what, 1, 5));  // the MTP families' chains; the DFlash2 block is its checkpoint's
           e.mtp_depth_set = true;
         } else if (p.key == "compact_batches")
           e.compact_batches = boolean(x, ek, what);
@@ -322,6 +350,27 @@ ClusterConfig parse_cluster_config(const std::string& json, const std::string& w
           if (!(e.mtp_schedule_lambda >= 0.0)) fail(what, "'" + ek + "' must be >= 0 (0: the reservation rate)");
         } else if (p.key == "mtp_schedule_min_depth") e.mtp_schedule_min_depth = static_cast<int>(integer(x, ek, what, 1, 5));
         else if (p.key == "mtp_schedule_adapt") e.mtp_schedule_adapt = boolean(x, ek, what);
+        else if (p.key == "mtp_schedule_sampled_scale") {
+          e.mtp_schedule_sampled_scale = number(x, ek, what);
+          if (!(e.mtp_schedule_sampled_scale >= 0.0 && e.mtp_schedule_sampled_scale <= 1.0))
+            fail(what, "'" + ek + "' must be in [0, 1] (0: sampled requests verify the whole block)");
+        }
+        else if (p.key == "mtp_draft") {
+          e.mtp_draft = text(x, ek, what);
+          if (e.mtp_draft != "auto" && e.mtp_draft != "sampled" && e.mtp_draft != "greedy")
+            fail(what, "'" + ek + "' must be auto, sampled or greedy");
+        }
+        else if (p.key == "dflash_batch_rows") e.dflash_batch_rows = static_cast<int>(integer(x, ek, what, 0, 4096));
+        else if (p.key == "mtp_verify") {
+          e.mtp_verify = text(x, ek, what);
+          if (e.mtp_verify != "token" && e.mtp_verify != "block")
+            fail(what, "'" + ek + "' must be token or block");
+        }
+        else if (p.key == "mtp_draft_temperature") {
+          e.mtp_draft_temperature = number(x, ek, what);
+          if (!(e.mtp_draft_temperature > 0.0 && e.mtp_draft_temperature <= 4.0))
+            fail(what, "'" + ek + "' must be in (0, 4] (the drawn drafts' temperature as a fraction of the request's)");
+        }
         else if (p.key == "sampling_candidates") e.sampling_candidates = static_cast<int>(integer(x, ek, what, 1, 256));
         else if (p.key == "prefix_cache_gib") {
           e.prefix_cache_gib = number(x, ek, what);
@@ -368,6 +417,8 @@ ClusterConfig parse_cluster_config(const std::string& json, const std::string& w
     fail(what, "'node_env' must have one entry per node");
   if (c.fabric_port == c.journal_port)
     fail(what, "'ports.fabric' and 'ports.journal' must differ");
+  if (c.metrics_port != 0 && (c.metrics_port == c.fabric_port || c.metrics_port == c.journal_port))
+    fail(what, "'ports.metrics' must differ from 'ports.fabric' and 'ports.journal'");
   return c;
 }
 

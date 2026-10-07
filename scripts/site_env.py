@@ -21,7 +21,6 @@ SITE_KEYS = (
     "DGPP_LOG_LEVEL", "DGPP_MLOCK",
     # The engine's L2 weight-prefetch knobs (src/kernels/l2_prefetch.hpp); site
     # settings so an A/B runs with the same setting on every rank.
-    "DGPP_L2_PREFETCH", "DGPP_L2_PREFETCH_MB", "DGPP_L2_PREFETCH_BOUNDARY", "DGPP_L2_PREFETCH_LAYER",
     # The bus timeline (DGPP_BUS_TIMELINE=1: the graph windows' and the prefill
     # folds' decomposition at INFO) and the dense-lowering A/B switches
     # (DGPP_DSV41_DENSE_GEMV=1 for DeepSeek; DGPP_DENSE_GEMV_ROWS=n for the
@@ -33,7 +32,6 @@ NODE_KEYS = ("DGPP_ROCE_DEVICES", "DGPP_ROCE_GID_INDICES", "HF_HUB_CACHE", "DGPP
     "DGPP_LOG_LEVEL", "DGPP_MLOCK",
     # The engine's L2 weight-prefetch knobs (src/kernels/l2_prefetch.hpp): an A/B runs
     # with the same setting on every rank.
-    "DGPP_L2_PREFETCH", "DGPP_L2_PREFETCH_MB", "DGPP_L2_PREFETCH_BOUNDARY", "DGPP_L2_PREFETCH_LAYER",
     "DGPP_BUS_TIMELINE", "DGPP_DSV41_DENSE_GEMV", "DGPP_DENSE_GEMV_ROWS", "DGPP_DSV41_EAGER_FOLD",
 )
 DEFAULTS = {
@@ -152,9 +150,9 @@ def deployment(path):
     cfg = json.loads(Path(path).read_text())
     if not isinstance(cfg, dict):
         raise ValueError("deployment config must be an object")
-    if set(cfg) & {"nodes", "ssh_user", "ports"}:
-        raise ValueError("move nodes, ssh_user, and ports out of the deployment JSON into .env; use world_size")
-    unknown = set(cfg) - {"model", "world_size", "release", "engine", "paths", "http"}
+    if set(cfg) & {"nodes", "ssh_user"}:
+        raise ValueError("move nodes and ssh_user out of the deployment JSON into .env; use world_size")
+    unknown = set(cfg) - {"model", "world_size", "release", "engine", "paths", "http", "ports"}
     if unknown:
         raise ValueError("unknown deployment keys: " + ", ".join(sorted(unknown)))
     if not isinstance(cfg.get("model"), str) or not cfg["model"]:
@@ -167,6 +165,11 @@ def deployment(path):
     # forbid worlds that would have worked.
     if type(cfg.get("world_size")) is not int or cfg["world_size"] < 1:
         raise ValueError("deployment world_size must be a positive integer")
+    ports = cfg.get("ports", {})
+    if not isinstance(ports, dict) or set(ports) - {"metrics"}:
+        raise ValueError("deployment ports may only contain metrics; set fabric and journal ports in .env and HTTP in http.port")
+    if "metrics" in ports and (type(ports["metrics"]) is not int or not 0 <= ports["metrics"] <= 65535):
+        raise ValueError("ports.metrics must be 0 (off) or an integer in [1, 65535]")
     paths = cfg.get("paths", {})
     if not isinstance(paths, dict) or set(paths) - {"resident_cache"}:
         raise ValueError("deployment paths may only contain resident_cache; move site paths into .env")
@@ -276,6 +279,7 @@ def resolve_config(path, values=None):
     cfg = deployment(path)
     cfg["nodes"] = selected_nodes(values, cfg.pop("world_size"))
     cfg["ssh_user"] = ssh_user(values)
+    deployment_ports = cfg.get("ports", {})
     cfg["ports"] = {name: port(values, name) for name in ("http", "fabric", "journal")}
     if cfg["ports"]["fabric"] == cfg["ports"]["journal"]:
         raise ValueError("DGPP_FABRIC_PORT and DGPP_JOURNAL_PORT must differ")
@@ -284,6 +288,11 @@ def resolve_config(path, values=None):
     cfg["ports"]["http"] = cfg["http"]["port"]
     if len(cfg["nodes"]) > 1 and len(set(cfg["ports"].values())) != 3:
         raise ValueError("HTTP, fabric, and journal ports must differ for multi-node deployments")
+    if "metrics" in deployment_ports:
+        metrics = deployment_ports["metrics"]
+        if metrics in (cfg["ports"]["fabric"], cfg["ports"]["journal"]):
+            raise ValueError("ports.metrics must differ from the fabric and journal ports")
+        cfg["ports"]["metrics"] = metrics
     cfg["node_env"] = node_environments(values, cfg["nodes"])
     return cfg
 

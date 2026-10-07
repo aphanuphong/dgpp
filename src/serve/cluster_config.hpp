@@ -41,6 +41,9 @@ struct ClusterConfig {
   std::vector<std::map<std::string, std::string>> node_env;
   int fabric_port = 29970;
   int journal_port = 29971;
+  // Each peer rank's metrics listener (rank_metrics.hpp), on its own node
+  // address; 0 = off. Rank-local: not part of the config digest.
+  int metrics_port = 0;
   struct Engine {
     int max_concurrency = 8;
     int64_t kv_capacity = 8192;
@@ -114,9 +117,17 @@ struct ClusterConfig {
     //     checkpoint's 128 x 128 weight scales, fp32 promotion per group —
     //     the reference stack's cutlass blockwise GEMM) instead of the
     //     dequantized bf16 GEMM. Requires engine.dense_weights = fp8.
+    //   prefill_fp8_per_tensor: the Qwen3.8-27B prefill recipe — every FP8
+    //     projection's prefill GEMM (rows above the decode GEMV band, and
+    //     every resumed chunk) on cuBLASLt's per-tensor-scale e4m3 kernels
+    //     from boot-requantized per-tensor weights and per-call per-tensor
+    //     activations: ~2x the dequantized bf16 GEMM's rate, +23 GiB
+    //     resident at the 27B's shape, and not transcript-preserving at
+    //     long context. Default: the dequantized bf16 GEMM (exact).
     bool prefill_bf16_partials = false;
     bool prefill_fold_scales = false;
     bool prefill_fp8_gemm = false;
+    bool prefill_fp8_per_tensor = false;
     // The packed expert GEMM's form and companions (2026-09-30; every
     // serving switch is a config key — no environment variable selects a
     // kernel). All bitwise the default chain.
@@ -154,6 +165,10 @@ struct ClusterConfig {
     int default_max_tokens = 256;
     FileInputConfig file_inputs;
     int queue_limit = 64;
+    // Rank 0 holds the first arrival at an idle engine this long for the
+    // rest of its burst (requests sent together land a few ms apart), so
+    // they are read in together. 0: tick at once.
+    int admission_gather_ms = 3;
     int max_connections = 64;
     bool no_eos = false;
     bool compact_batches = false;
@@ -161,6 +176,43 @@ struct ClusterConfig {
     bool mtp = false;
     int mtp_depth = 1;             // draft tokens per step (1..5); needs mtp
     bool mtp_depth_set = false;    // the file named it (else a family may default it: DSpark's block is 5)
+    // The DFlash2 block drafter (Qwen3.5-family, eager path only): a
+    // checkpoint directory or HF id whose config.json names the drafter.
+    // Replaces mtp (mutually exclusive); the draft width is the
+    // checkpoint's block_size - 1.
+    std::string dflash_model = "";
+    // The drafter's block matrices as served: "checkpoint" (bf16, packed
+    // lossless 12-bit under bf16_weights bf12) or "fp8" (block-128 E4M3 —
+    // lossy for the proposals only; the target's verify is exact).
+    std::string dflash_weights = "checkpoint";
+    // Its serving options: the multi-slot verify replayed as a captured
+    // graph (the measured best), the redrafts stacked across slots, and a
+    // verify-depth cap (0 = the whole block; transcripts are exact at any
+    // value — unverified drafts re-draft next step).
+    bool dflash_verify_graph = true;
+    // Several cold prompts prefilled as the spans of one walk (the graph
+    // worlds' admission). false: one prompt per walk — a prompt's prefill
+    // then never depends on who arrived with it (the walk's row count
+    // selects the GEMM lowering above 128 rows; a prompt shorter than that
+    // started together with others can otherwise read differently from the
+    // same prompt alone), at the cost of a burst's prefill throughput.
+    bool prefill_group = true;
+    // The L2 weight prefetcher (kernels/l2_prefetch.hpp; environment
+    // variables until 2026-10-05): on/off, the form (load the bytes; one
+    // L2 prefetch per 128-byte line; or touch one line per 64 KB for the
+    // page walks alone), the window budget
+    // in MiB, the boundary windows' budget (0: the window budget), the
+    // rates (off | light | full) of the windows beside a collective and
+    // inside the attention layers, and whether adjacent ranges merge.
+    bool l2_prefetch = true;
+    std::string l2_prefetch_form = "load";
+    int l2_prefetch_window_mib = 12;
+    int l2_prefetch_boundary_window_mib = 20;
+    std::string l2_prefetch_boundary_rate = "light";
+    std::string l2_prefetch_layer_rate = "light";
+    bool l2_prefetch_merge = true;
+    bool dflash_draft_batch = true;
+    int dflash_depth = 0;
     // The confidence-scheduled verify depth (engine/verify_schedule.hpp,
     // 2026-09-14; needs mtp and a family with a confidence head — DSpark):
     // a step verifies only the leading drafts whose prefix survival beats
@@ -175,6 +227,30 @@ struct ClusterConfig {
     double mtp_schedule_lambda = 0.0;
     int mtp_schedule_min_depth = 1;
     bool mtp_schedule_adapt = true;  // lambda follows the modeled throughput, floored at mtp_schedule_lambda
+    // A sampled request's acceptance per position as a fraction of the
+    // confidence head's, when its drafts are the draft's argmax
+    // (mtp_draft greedy); 0: sampled requests verify the whole block.
+    double mtp_schedule_sampled_scale = 0.93;
+    // A sampled request's drafts: "sampled" (draws from the draft's own
+    // distribution, the ratio verify), "greedy" (the draft's argmax, accepted
+    // with probability P(draft)) or "auto" (the family's measured better
+    // rule: greedy for a DSpark block, sampled elsewhere). Exact either way.
+    std::string mtp_draft = "auto";
+    // The drawn drafts' temperature as a fraction of the request's (the
+    // proposal is the draft's distribution at THIS temperature; any value is
+    // exact — it only moves the overlap with the target, i.e. the acceptance
+    // rate: a sharper draft keeps the argmax's rate on sharp distributions,
+    // the request's keeps the overlap on flat ones). 1: the request's.
+    double mtp_draft_temperature = 1.0;
+    // The sampled chain's verify rule: "block" (block verification — the
+    // drafts decided jointly; exact, never fewer tokens in expectation
+    // than the token rule) or "token" (the token-by-token test).
+    std::string mtp_verify = "token";
+    // The block drafter's batched verify rows budget: a batch family whose
+    // slots times the block exceed it verifies the first drafts of every
+    // slot's block (exact; the drafter proposes the whole block either
+    // way). 0: every family verifies the whole block.
+    int dflash_batch_rows = 0;
     int graph_batch_min_live = 0;  // 0 = min(2, max_concurrency) (the batch family, 2026-09-07)
     int sampling_candidates = 128;
     double prefix_cache_gib = 1.5;

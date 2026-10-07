@@ -7,6 +7,7 @@
 
 #include "common/cuda_check.hpp"
 #include "common/log.hpp"
+#include "engine/pool_exhausted.hpp"
 #include "kernels/dsa.hpp"
 #include "kernels/glm_mhc_launch.hpp"
 #include "kernels/glm_moe_launch.hpp"
@@ -287,8 +288,12 @@ void GlmDiagnosticModel::prefill_chunk(PrefillCursor& cursor, int64_t budget) {
   }
   for (auto* at = snap; at != nullptr; at = at->next) {
     if (!at->taken && at->position == c1) {
-      *at->meta = session_snapshot(req, at->dst);
-      at->taken = true;
+      try {
+        *at->meta = session_snapshot(req, at->dst);
+        at->taken = true;
+      } catch (const CachePoolExhausted& e) {
+        DGPP_LOG_WARN("prefix cache: snapshot at {} skipped for slot {}: {}", c1, req, e.what());
+      }
     }
   }
   cursor.next = c1;
@@ -631,7 +636,7 @@ GlmDiagnosticModel::SessionSnapshotMeta GlmDiagnosticModel::session_snapshot(
       const int32_t b = pool_.acquire_pinned_block();
       if (b < 0) {
         pool_.unpin_blocks(meta.full_blocks.data(), n_full);
-        throw std::runtime_error("session_snapshot: cache pool exhausted (the partial block)");
+        throw CachePoolExhausted("session_snapshot: cache pool exhausted (the partial block)");
       }
       pool_.copy_block_contents(row[n_full], b, stream_);
       meta.partial_block = b;
@@ -723,7 +728,7 @@ GlmDiagnosticModel::SessionSnapshotMeta GlmDiagnosticModel::session_snapshot_pos
       const int32_t b = pool_.acquire_pinned_block();
       if (b < 0) {
         pool_.unpin_blocks(meta.full_blocks.data(), n_full);
-        throw std::runtime_error(
+        throw CachePoolExhausted(
             "session_snapshot_post_row0: cache pool exhausted (the partial block)");
       }
       pool_.copy_block_contents(row[n_full], b, stream_);
@@ -1127,7 +1132,7 @@ void GlmDiagnosticModel::session_graph_use_batch_contract(
 }
 
 void GlmDiagnosticModel::session_graph_capture_commit(
-    int req, const PickVerdict* device_verdict) {
+    int req, const PickVerdict* device_verdict, int rows) {
   if (req < 0 || req >= max_requests_)
     throw std::out_of_range("session_graph_capture_commit: request slot " +
                             std::to_string(req));
@@ -1135,7 +1140,11 @@ void GlmDiagnosticModel::session_graph_capture_commit(
     throw std::logic_error(
         "session_graph_capture_commit: the step must be captured with "
         "device positions (the commit advances the device position)");
-  glm_spec_commit(device_verdict, decode_rows_, spec_segments(req),
+  if (rows < 0 || rows > decode_rows_)
+    throw std::invalid_argument("session_graph_capture_commit: rows outside [0, decode rows]");
+  // The step's rows (a reduced-depth variant records fewer than the decode
+  // rows): "every row stood" must be judged against them.
+  glm_spec_commit(device_verdict, rows > 0 ? rows : decode_rows_, spec_segments(req),
                   d_session_pos_ + req, stream_);
 }
 
@@ -1363,7 +1372,7 @@ GlmDiagnosticModel::Outputs GlmDiagnosticModel::session_run_rows(
   if (!capture_mode) debug_sync("embed", -1, decode_row);
 
   Outputs out;
-  out.routes.reserve(static_cast<size_t>(cfg_.num_hidden_layers));
+  if (decode_route_traces_) out.routes.reserve(static_cast<size_t>(cfg_.num_hidden_layers));
   uint16_t* cur = streams_[0];
   uint16_t* nxt = streams_[1];
   int dsa_ordinal = 0;
@@ -1681,13 +1690,19 @@ GlmDiagnosticModel::Outputs GlmDiagnosticModel::session_run_rows(
         trace.ids = moe_prefill_trace_ids_ + lay * mt * moe_cfg_.top_k;
         trace.weights = moe_prefill_trace_weights_ + lay * mt * moe_cfg_.top_k;
         trace.biased = moe_prefill_trace_biased_ + lay * mt * moe_cfg_.n_experts;
-        moe_->enqueue_prefill(normed_, ffn_out, T, &trace, stream_);
-        GlmRouteTraceLayer route;
-        route.layer_idx = static_cast<uint32_t>(layer);
-        route.top_k = static_cast<uint32_t>(moe_cfg_.top_k);
-        route.tokens = static_cast<uint64_t>(T);
-        out.routes.push_back(std::move(route));  // ids/weights: post-sync
-        out.route_biased.emplace_back();
+        // Serving needs logits and hidden states only. Retaining these
+        // diagnostic scores across chunks costs ~50 KiB per prompt token
+        // on Flash: over 12 GiB per rank at 256K, outside the KV budget.
+        moe_->enqueue_prefill(normed_, ffn_out, T,
+                              decode_route_traces_ ? &trace : nullptr, stream_);
+        if (decode_route_traces_) {
+          GlmRouteTraceLayer route;
+          route.layer_idx = static_cast<uint32_t>(layer);
+          route.top_k = static_cast<uint32_t>(moe_cfg_.top_k);
+          route.tokens = static_cast<uint64_t>(T);
+          out.routes.push_back(std::move(route));  // ids/weights: post-sync
+          out.route_biased.emplace_back();
+        }
         ++moe_prefill_calls;
       }
     }

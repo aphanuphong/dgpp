@@ -129,6 +129,17 @@ class CublasLtGemm : public IGemm {
                         uint16_t* out, int m, int n, int k, void* workspace, size_t ws_bytes,
                         cudaStream_t stream);
 
+  // E4M3 x E4M3 with per-call scalar scales (F32 device pointers) and BF16
+  // output. Same D[M,N] = Act[M,K] x W[N,K]^T convention; `weight` holds
+  // X/448 codes, `act_scale`/`weight_scale` the two grid maxabs values.
+  // Reuses the cached F8 plan (its unit-scale pointers are overwritten per
+  // call, the bias-pointer precedent) — the caller must have run
+  // ensure_plan(m, n, k, F8_E4M3, BF16, ...) first.
+  void matmul_fp8_scaled(const uint8_t* act, const uint8_t* weight,
+                         const float* act_scale, const float* weight_scale,
+                         uint16_t* out, int m, int n, int k, void* workspace,
+                         size_t ws_bytes, cudaStream_t stream);
+
   size_t query_workspace_bytes(int m, int n, int k, DType io_dtype) override;
 
   bool ensure_plan(int m, int n, int k, DType io_dtype, GemmOut out_dtype,
@@ -148,13 +159,22 @@ class CublasLtGemm : public IGemm {
   // for every row of the launch, each row's chain the same whatever m. The
   // two forms are tolerance-equal, not bitwise, so a model opts in for all
   // its calls through this instance. Shapes the mma form cannot take keep
-  // the GEMV chunks. max_rows bounds the form: 0 takes every row count
-  // (DeepSeek: its group prefill's spans are then bitwise their prefills
-  // alone), a bound hands wider calls to the Lt algorithm (the session-core
-  // families: Lt is ahead of the streaming form's 128-row groups from a
-  // dozen bf16 rows — bf16_gemv_test's table, 2026-09-14).
-  void set_decode_mma(bool on, int max_rows = 0);
+  // the GEMV chunks. min_rows leaves narrower calls on their existing
+  // dispatch (the C1 gate's m=1 GEMV row stays the GEMV's, not the mma's);
+  // max_rows bounds the form: 0 takes every row count (DeepSeek: its group
+  // prefill's spans are then bitwise their prefills alone), a bound hands
+  // wider calls to the Lt algorithm (the session-core families: Lt is ahead
+  // of the streaming form's 128-row groups from a dozen bf16 rows —
+  // bf16_gemv_test's table, 2026-09-14).
+  void set_decode_mma(bool on, int min_rows = 1, int max_rows = 0);
   bool decode_mma() const override;
+  // The tensor-core form's split-K for the decode-shaped bf16 calls (m <=
+  // kMmaGemvMaxRows; mma_gemv.hpp): the caller's matmul workspace holds the
+  // fp32 partials. A row's chain is then the same whatever m rides in the
+  // launch, but not the unsplit chain — a model turns it on for its decode
+  // walks and off for its prefill walks when a short prefill chunk must stay
+  // bitwise the rows of a long one. Off by default.
+  void set_decode_split_k(bool on);
   int decode_mma_max_rows() const override;
 
   // A lossless 12-bit companion of a bf16 weight (bf12_gemv.hpp): the GEMV
@@ -172,6 +192,16 @@ class CublasLtGemm : public IGemm {
   // row's reduction does not depend on the block it rode in: the blocks are
   // then bitwise the chunk (gemm_split_test). The caller resets it.
   void set_plan_rows(int rows);
+  // bf16 Lt calls above the decode lowering (the prefill-shaped products:
+  // the dequant bridge's, the chunked prefill's) take the algorithm the
+  // heuristic picks for `rows` whatever their own row count, so a prompt's
+  // reduction does not depend on the walk it rode in — alone, as a span of
+  // a group walk, or as a chunk (2026-10-05: cuBLASLt's heuristic changes
+  // its kernel with m, and a group of four prompts read different bits
+  // from the same prompt alone). 0: each call's own algorithm. The pinned
+  // algorithm is checked for the call's shape; a shape it cannot take
+  // falls back to its own (logged once).
+  void set_pinned_rows(int rows);
   void register_bf12(const void* weight, const Bf12Matrix& packed);
   // The companions' five-to-eight-row launches: on only while the caller's
   // rows are a DECODE batch. The interface cannot tell a decode call from a

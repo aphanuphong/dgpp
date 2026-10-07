@@ -1139,7 +1139,9 @@ bool GenerationService::parse_chat(const dgpp::minijson::Value& body,
         // The DSML invoke names the tool as the schema lists it —
         // "namespace::name" under a namespace — and the grammar's targets
         // must spell the same (the parser strips the namespace again).
-        if (markers_.tool_format() == dgpp::text::ToolFormat::kDsml) {
+        // DeepSeek-V4's dialect has no namespaces: the schema lists the
+        // function's name as given, and so does the grammar.
+        if (markers_.dsml_namespaces()) {
           try {
             g.tools.back().name = dgpp::text::Dsv41Prompt::qualified_tool_name(t);
           } catch (const std::exception& e) {
@@ -1150,7 +1152,7 @@ bool GenerationService::parse_chat(const dgpp::minijson::Value& body,
       }
       // A named choice under DSML names the function; the target is its
       // qualified spelling.
-      if (g.mode == GrammarSpec::Mode::kNamed && markers_.tool_format() == dgpp::text::ToolFormat::kDsml)
+      if (g.mode == GrammarSpec::Mode::kNamed && markers_.dsml_namespaces())
         for (const dgpp::text::GrammarTool& tool : g.tools)
           if (tool.name == g.named || (tool.name.size() > g.named.size() + 2 &&
                                        tool.name.compare(tool.name.size() - g.named.size() - 2, std::string::npos,
@@ -1379,6 +1381,10 @@ bool GenerationService::parse_chat(const dgpp::minijson::Value& body,
     if (refusal && (r != "assistant" || !refusal->is_string()))
       return refuse("refusal must be a string on an assistant message", where + ".refusal");
     if ((!content || content->is_null()) && refusal) content = refusal;
+    // Anthropic-style thinking parts in assistant history (Claude Code echoes them back
+    // through LiteLLM) fold into reasoning_content, which the template already renders.
+    std::string thinking_text;
+    bool saw_thinking = false;
     if (content && content->is_array() && r != "tool") {
       std::vector<Value> parts;
       for (size_t j = 0; j < content->items().size(); ++j) {
@@ -1389,6 +1395,18 @@ bool GenerationService::parse_chat(const dgpp::minijson::Value& body,
           return refuse("content part must be an object with a type", at);
         if (part.find("prompt_cache_breakpoint"))
           return refuse("explicit cache breakpoints are not supported", at + ".prompt_cache_breakpoint", "unsupported_parameter");
+        if (r == "assistant" && (type->as_string() == "thinking" || type->as_string() == "redacted_thinking")) {
+          if (type->as_string() == "thinking") {
+            const auto* t = part.find("thinking");
+            if (t && !t->is_string()) return refuse("thinking must be a string", at + ".thinking");
+            if (t && !t->as_string().empty()) {
+              if (!thinking_text.empty()) thinking_text += "\n\n";
+              thinking_text += t->as_string();
+            }
+          }
+          saw_thinking = true;
+          continue;
+        }
         if (type->as_string() == "image_url") {
           if (r != "user") return refuse("images require a user message", at + ".type", "unsupported_content_type");
           if (!frontend_->supports_images() || !engine_->supports_images())
@@ -1407,7 +1425,9 @@ bool GenerationService::parse_chat(const dgpp::minijson::Value& body,
         if (!text || !text->is_string()) return refuse("content part text must be a string", at);
         parts.push_back(is_refusal ? Value::make_object({{"type", Value::make_string("text")}, {"text", *text}}) : part);
       }
-      normalized_content = Value::make_array(std::move(parts));
+      // only thinking parts: the visible content is empty
+      normalized_content = (saw_thinking && parts.empty()) ? Value::make_string("")
+                                                            : Value::make_array(std::move(parts));
       content = &normalized_content;
     }
     std::vector<Member> members;
@@ -1525,6 +1545,11 @@ bool GenerationService::parse_chat(const dgpp::minijson::Value& body,
       }
       if (!content_written)
         members.push_back(Member{"content", Value::make_string("")});
+      if (!thinking_text.empty()) {
+        const Value* rc = msg.find("reasoning_content");
+        if (rc == nullptr || rc->is_null())
+          members.push_back(Member{"reasoning_content", Value::make_owned_string(thinking_text)});   // owned: thinking_text dies with this loop
+      }
     } else if (r == "tool") {
       if (content == nullptr || !(content->is_string() || content->is_array()))
         return refuse(where + ".content is required for a tool message: a "
@@ -1586,14 +1611,14 @@ bool GenerationService::parse_chat(const dgpp::minijson::Value& body,
   globals.push_back(Member{"messages", Value::make_array(std::move(msgs))});
   if (have_tools && choice != Choice::kNone) {
     // Keep function fields in their original wrapped or flat shape, plus
-    // DeepSeek namespaces so rendered names agree with the tool grammar.
+    // DeepSeek-V4.1 namespaces so rendered names agree with the tool grammar.
     // Omit unrelated metadata, such as BFCL's function-level response schemas.
     // DGPP_TOOLS_RAW=1 renders the tools verbatim.
     static const bool raw = std::getenv("DGPP_TOOLS_RAW") != nullptr;
     if (raw) {
       globals.push_back(Member{"tools", *tools});
     } else {
-      const bool dsml = markers_.tool_format() == dgpp::text::ToolFormat::kDsml;
+      const bool dsml = markers_.dsml_namespaces();
       const auto keep_function_field = [dsml](std::string_view key) {
         return key == "name" || key == "description" || key == "parameters" || key == "strict" ||
                (dsml && key == "namespace");
@@ -2338,36 +2363,213 @@ Scheduler::Meters GenerationService::meters() const {
   return meters_;
 }
 
-// GET /metrics/prometheus (Prometheus text exposition for spec-decode
-// counters; tool-eval-bench scrapes these for acceptance rate / length)
+void GenerationService::count_live(Scheduler::Meters* m,
+                                   const std::vector<dgpp::PrefillMonitor::Request>& prefills) const {
+  m->active = 0;
+  m->queued = 0;
+  m->prefilling = static_cast<int>(prefills.size());
+  for (const auto& r : records_) {
+    if (r->done || r->reject_overloaded) continue;
+    const bool prefilling = std::any_of(prefills.begin(), prefills.end(),
+                                       [&](const auto& p) { return p.id == r->sched_id; });
+    if (prefilling || !r->ids.empty()) ++m->active;
+    else ++m->queued;
+  }
+}
+
+// GET /metrics/prometheus: the Prometheus text exposition (format 0.0.4).
+// The JSON route's counters with Prometheus types under dgpp_ names, the
+// latency and size distributions JSON cannot carry, and the three
+// unprefixed, unlabeled spec_decode_* counters the route first served
+// (tool-eval-bench scrapes those), kept verbatim. Rank 0's view: the
+// serving rank's counters describe the whole world's work once.
 void GenerationService::route_metrics_prometheus(HttpResponseWriter& w) {
   Scheduler::Meters m;
+  Stats st;
+  dgpp::sched::SchedulerEngine::PrefixEngineStats pe;
+  const auto prefills = engine_->prefill_monitor()->snapshot();
+  double snapshot_age_s = 0;
+  int64_t pending_admissions = 0, pending_cancellations = 0;
   {
     std::lock_guard<std::mutex> lock(mutex_);
     m = meters_;
+    st = stats_;
+    pe = prefix_stats_;
+    snapshot_age_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - meters_published_).count();
+    pending_admissions = static_cast<int64_t>(pending_admissions_.size());
+    pending_cancellations = static_cast<int64_t>(pending_cancels_.size());
+    count_live(&m, prefills);
   }
   uint64_t drafted = 0, accepted = 0;
   for (int p = 0; p < m.mtp.depth && p < 8; ++p) {
     drafted += m.mtp.attempts[p];
     accepted += m.mtp.accepts[p];
   }
-  std::string out =
+  prom::Writer out("model_name=\"" + prom::escape_label(cfg_.model_id) + "\"");
+  out.raw(
       "# HELP spec_decode_num_draft_tokens_total Cumulative MTP draft tokens verified.\n"
       "# TYPE spec_decode_num_draft_tokens_total counter\n"
-      "spec_decode_num_draft_tokens_total ";
-  out.append(std::to_string(drafted));
-  out.append(
+      "spec_decode_num_draft_tokens_total " + std::to_string(drafted) +
       "\n# HELP spec_decode_num_accepted_tokens_total Cumulative accepted draft tokens.\n"
       "# TYPE spec_decode_num_accepted_tokens_total counter\n"
-      "spec_decode_num_accepted_tokens_total ");
-  out.append(std::to_string(accepted));
-  out.append(
+      "spec_decode_num_accepted_tokens_total " + std::to_string(accepted) +
       "\n# HELP spec_decode_num_drafts_total Cumulative verification rounds.\n"
       "# TYPE spec_decode_num_drafts_total counter\n"
-      "spec_decode_num_drafts_total ");
-  out.append(std::to_string(m.mtp.attempts[0]));
-  out.push_back('\n');
-  w.respond(200, "text/plain; version=0.0.4", std::move(out));
+      "spec_decode_num_drafts_total " + std::to_string(m.mtp.attempts[0]) + "\n");
+
+  const auto& policy = sched_.admission_policy();
+  out.gauge("dgpp_build_info", "The server's build and world; the value is always 1.", int64_t{1},
+            "version=\"" + prom::escape_label(cfg_.build_version) + "\",git_sha=\"" +
+                prom::escape_label(cfg_.build_git_sha) + "\",world_size=\"" + std::to_string(cfg_.world_size) +
+                "\",admission=\"" + dgpp::sched::AdmissionPolicy::name(policy.mode) + "\"");
+  out.gauge("dgpp_engine_failed", "1 once the engine has failed (the service then refuses work).",
+            int64_t{failed() ? 1 : 0});
+  out.gauge("dgpp_max_concurrent_requests", "Engine request slots.", int64_t{engine_->max_concurrent_requests()});
+  out.gauge("dgpp_queue_limit", "Admission queue bound (beyond it, 503).", int64_t{cfg_.queue_limit});
+  out.gauge("dgpp_kv_pool_tokens", "K/V pool capacity in tokens.", cfg_.kv_pool_tokens);
+  out.gauge("dgpp_admission_window_tokens", "Grow-on-demand reservation step.", int64_t{policy.window_tokens});
+  out.gauge("dgpp_admission_prefill_budget_tokens", "Prefill tokens per tick with decode active (0: monolithic).",
+            int64_t{policy.prefill_budget_tokens});
+  out.gauge("dgpp_admission_prefill_idle_budget_tokens", "Prefill tokens per tick without active decode.",
+            int64_t{policy.prefill_idle_budget_tokens});
+
+  // Occupancy.
+  out.gauge("dgpp_num_requests_running", "Requests holding an engine slot (prefilling included).", int64_t{m.active});
+  out.gauge("dgpp_num_requests_waiting", "Requests waiting for a slot.", int64_t{m.queued});
+  out.gauge("dgpp_num_requests_prefilling", "Requests in prefill now.", int64_t{m.prefilling});
+  out.gauge("dgpp_pending_admissions", "Admissions the engine thread has not applied yet.", pending_admissions);
+  out.gauge("dgpp_pending_cancellations", "Cancellations the engine thread has not applied yet.", pending_cancellations);
+  out.gauge("dgpp_kv_pool_blocks_total", "K/V pool blocks.", m.pool_blocks_total);
+  out.gauge("dgpp_kv_pool_blocks_in_use", "K/V pool blocks reserved by live requests and cache entries.",
+            m.pool_blocks_in_use);
+  out.gauge("dgpp_kv_cache_usage_perc", "K/V pool blocks in use over total (0-1).",
+            m.pool_blocks_total > 0 ? static_cast<double>(m.pool_blocks_in_use) / static_cast<double>(m.pool_blocks_total)
+                                    : 0.0);
+  out.gauge("dgpp_scheduler_snapshot_age_seconds", "Age of the scheduler counters below (published per engine pass).",
+            snapshot_age_s);
+  {
+    int64_t total = 0, processed = 0;
+    for (const auto& p : prefills) {
+      total += p.total;
+      processed += p.processed;
+    }
+    out.gauge("dgpp_prefill_inflight_prompt_tokens", "Prompt tokens of the prefills in progress.", total);
+    out.gauge("dgpp_prefill_inflight_remaining_tokens", "Prompt tokens those prefills have left.", total - processed);
+  }
+
+  // Requests.
+  out.counter("dgpp_requests_total", "Validated requests that reached admission.", st.requests_total);
+  out.counter("dgpp_requests_shed_total", "Requests refused with 503 at the door or at admission.", st.requests_shed);
+  out.counter("dgpp_requests_shed_pool_total", "Requests cut short at K/V pool exhaustion (grow-on-demand).",
+              st.requests_shed_pool);
+  out.counter("dgpp_requests_cancelled_total", "Client disconnects (and the stop).", st.requests_cancelled);
+  out.counter("dgpp_requests_failed_total", "Live requests an engine failure cut off.", st.requests_failed);
+  out.counter("dgpp_requests_rejected_total", "400-class refusals.", st.rejects_bad);
+  out.counter("dgpp_tool_calls_total", "Parsed tool calls returned.", st.tool_calls_out);
+  out.counter("dgpp_reservations_grown_total", "Grow-on-demand reservation growth events.", m.reservations_grown);
+  {
+    static constexpr const char* kReason[Stats::kReasons] = {"none", "eos", "length", "cancelled", "pool_exhausted",
+                                                              "stop"};
+    for (int i = 0; i < Stats::kReasons; ++i)
+      out.counter("dgpp_request_finished_total", "Retired requests (choices) by scheduler reason.", st.finished[i],
+                  std::string("reason=\"") + kReason[i] + "\"");
+  }
+
+  // Tokens and engine time.
+  out.counter("dgpp_prompt_tokens_total", "Prompt tokens prefilled, prefix-cache attaches included.", m.prompt_tokens);
+  out.counter("dgpp_prompt_tokens_computed_total", "Prompt tokens actually computed (attached prefixes excluded).",
+              m.prompt_tokens_computed);
+  out.counter("dgpp_prompt_tokens_cached_total", "Prompt tokens served from the prefix cache.",
+              m.prompt_tokens - m.prompt_tokens_computed);
+  out.counter("dgpp_generation_tokens_total", "Tokens generated.", m.tokens_generated);
+  out.counter("dgpp_prompts_prefilled_total", "Prompts whose prefill completed.", m.prompts_prefilled);
+  out.counter("dgpp_prefill_seconds_total", "Wall time inside the engine's prefill calls.", m.prefill_ms / 1000.0);
+  out.counter("dgpp_prefill_request_seconds_total", "Per-request prefill waits, summed (a group credits each member).",
+              m.prefill_request_ms / 1000.0);
+  out.counter("dgpp_decode_steps_total", "Decode passes.", m.decode_steps);
+  out.counter("dgpp_decode_rows_total", "Request-rows the decode passes carried.", m.decode_rows);
+  out.counter("dgpp_decode_step_seconds_total", "Wall time inside the engine's decode steps.", m.step_ms / 1000.0);
+
+  // Decode graph batches (docs/operations.md, decode graph batch counters).
+  out.gauge("dgpp_decode_batch_last_slots", "Capacity of the last launched decode graph.",
+            int64_t{m.decode_batch.slots});
+  out.gauge("dgpp_decode_batch_last_active", "Requests in the last launched decode graph.",
+            int64_t{m.decode_batch.active});
+  out.gauge("dgpp_decode_batch_last_rows_per_request", "Verification width of the last launch.",
+            int64_t{m.decode_batch.rows_per_request});
+  out.counter("dgpp_decode_batch_replays_total", "Decode graph launches.", m.decode_batch.replays);
+  out.counter("dgpp_decode_batch_rows_total", "Rows the decode graph launches carried.", m.decode_batch.rows);
+  out.counter("dgpp_decode_batch_padded_rows_total", "Padded verification rows in those launches.",
+              m.decode_batch.padded_rows);
+  for (int slots = 1; slots <= sched::SchedulerEngine::DecodeBatchStats::kMaxSlots; ++slots)
+    out.counter("dgpp_decode_batch_replays_by_slots_total", "Decode graph launches by graph capacity.",
+                m.decode_batch.replays_by_slots[slots], "slots=\"" + std::to_string(slots) + "\"");
+
+  // Speculative decoding (docs/openai-compatibility.md, speculative decoding counters).
+  out.gauge("dgpp_spec_decode_depth", "Configured MTP draft depth (0: off).", int64_t{m.mtp.depth});
+  out.counter("dgpp_spec_decode_num_drafts_total", "Request verification rounds.", m.mtp.attempts[0]);
+  out.counter("dgpp_spec_decode_num_draft_tokens_total", "Draft tokens verified.", drafted);
+  out.counter("dgpp_spec_decode_num_accepted_tokens_total", "Draft tokens accepted.", accepted);
+  for (int p = 0; p < m.mtp.depth && p < 8; ++p)
+    out.counter("dgpp_spec_decode_num_draft_tokens_per_pos_total", "Draft tokens verified at each draft position.",
+                m.mtp.attempts[p], "position=\"" + std::to_string(p) + "\"");
+  for (int p = 0; p < m.mtp.depth && p < 8; ++p)
+    out.counter("dgpp_spec_decode_num_accepted_tokens_per_pos_total", "Draft tokens accepted at each draft position.",
+                m.mtp.accepts[p], "position=\"" + std::to_string(p) + "\"");
+
+  // The prefix cache.
+  out.gauge("dgpp_prefix_cache_slots", "Prefix-cache snapshot slots (0: off).", int64_t{m.prefix_slots});
+  out.gauge("dgpp_prefix_cache_entries", "Live prefix-cache entries.", int64_t{m.prefix_entries});
+  out.gauge("dgpp_prefix_cache_blocks_pinned", "K/V pool blocks the entries pin.", m.prefix_blocks_pinned);
+  out.gauge("dgpp_prefix_cache_snapshot_bytes", "Bytes per arena snapshot.", pe.snapshot_bytes);
+  out.counter("dgpp_prefix_cache_hits_total", "Admissions that attached to an entry.", m.prefix_hits);
+  out.counter("dgpp_prefix_cache_misses_total", "Admissions that found no entry.", m.prefix_misses);
+  out.counter("dgpp_prefix_cache_queries_total", "Prefix-cache lookups (hits plus misses).",
+              m.prefix_hits + m.prefix_misses);
+  out.counter("dgpp_prefix_cache_tokens_saved_total", "Prompt tokens attaches skipped.", m.prefix_tokens_saved);
+  out.counter("dgpp_prefix_cache_snapshots_total", "Entries taken at prefill cuts.", m.prefix_snapshots);
+  out.counter("dgpp_prefix_cache_head_snapshots_total", "Entries taken at a prompt's first structural boundary.",
+              m.prefix_head_snapshots);
+  out.counter("dgpp_prefix_cache_close_entries_total", "Rolling snapshots kept as entries at retire.",
+              m.prefix_close_entries);
+  out.counter("dgpp_prefix_cache_rolling_snapshots_total", "Rolling snapshots of live requests.", m.prefix_rolling);
+  out.counter("dgpp_prefix_cache_hop_snapshots_total", "Hop snapshots.", m.prefix_hops);
+  out.counter("dgpp_prefix_cache_evictions_total", "Entries evicted.", m.prefix_evictions);
+  out.counter("dgpp_prefix_cache_duplicates_total", "Snapshots dropped as duplicates.", m.prefix_duplicates);
+  out.counter("dgpp_prefix_cache_skipped_no_block_total",
+              "Snapshots skipped because the K/V pool had no block to pin (pool pressure).",
+              m.prefix_skipped_no_block);
+  out.counter("dgpp_prefix_cache_skipped_no_slot_total", "Snapshots skipped for want of an arena slot.",
+              m.prefix_skipped);
+  out.counter("dgpp_prefix_cache_skipped_image_bytes_total", "Snapshots skipped over the image-bytes bound.",
+              m.prefix_skipped_image_bytes);
+  out.counter("dgpp_prefix_cache_arena_snapshots_total", "Arena snapshot copies.", pe.snapshots);
+  out.counter("dgpp_prefix_cache_arena_snapshot_seconds_total", "Time in arena snapshot copies.",
+              pe.snapshot_ms / 1000.0);
+  out.counter("dgpp_prefix_cache_arena_attaches_total", "Arena attach copies.", pe.attaches);
+  out.counter("dgpp_prefix_cache_arena_attach_seconds_total", "Time in arena attach copies.", pe.attach_ms / 1000.0);
+
+  // Distributions.
+  out.histogram("dgpp_time_to_first_token_seconds", "Door to first token, by prefix-cache attach.", st.ttft_hit_s,
+                "prefix_cache=\"hit\"");
+  out.histogram("dgpp_time_to_first_token_seconds", "Door to first token, by prefix-cache attach.", st.ttft_miss_s,
+                "prefix_cache=\"miss\"");
+  out.histogram("dgpp_request_queue_time_seconds", "Door to engine slot.", st.queue_s);
+  out.histogram("dgpp_request_prefill_time_seconds", "Engine slot to first token.", st.prefill_s);
+  out.histogram("dgpp_request_decode_time_seconds", "First token to retire.", st.decode_s);
+  out.histogram("dgpp_e2e_request_latency_seconds", "Door to retire.", st.e2e_s);
+  out.histogram("dgpp_request_time_per_output_token_seconds", "Decode time per output token after the first.",
+                st.tpot_s);
+  out.histogram("dgpp_inter_token_latency_seconds",
+                "Gap between engine passes that delivered a request's tokens (MTP lands several per pass).",
+                st.itl_s);
+  out.histogram("dgpp_decode_step_duration_seconds", "Engine decode step time (each pass's mean, per step).",
+                st.step_s);
+  out.histogram("dgpp_request_prompt_tokens", "Prompt tokens per request.", st.prompt_tokens);
+  out.histogram("dgpp_request_generation_tokens", "Generated tokens per request.", st.generation_tokens);
+  if (rank_metrics_)
+    write_rank_metrics(out, rank_identity_, m, snapshot_age_s, /*ticks=*/-1, rank_collectives_);
+  w.respond(200, "text/plain; version=0.0.4; charset=utf-8", out.take());
 }
 
 void GenerationService::route_metrics(HttpResponseWriter& w) {  Scheduler::Meters m;
@@ -2385,18 +2587,7 @@ void GenerationService::route_metrics(HttpResponseWriter& w) {  Scheduler::Meter
         std::chrono::steady_clock::now() - meters_published_).count();
     pending_admissions = pending_admissions_.size();
     pending_cancellations = pending_cancels_.size();
-    // Live gauges include admissions whose synchronous prefill has not yet
-    // returned to the scheduler, as well as requests waiting in the HTTP queue.
-    m.active = 0;
-    m.queued = 0;
-    m.prefilling = static_cast<int>(prefills.size());
-    for (const auto& r : records_) {
-      if (r->done || r->reject_overloaded) continue;
-      const bool prefilling = std::any_of(prefills.begin(), prefills.end(),
-                                         [&](const auto& p) { return p.id == r->sched_id; });
-      if (prefilling || !r->ids.empty()) ++m.active;
-      else ++m.queued;
-    }
+    count_live(&m, prefills);
   }
   std::string out = "{\"scheduler\":{\"active\":";
   append_json_int(&out, m.active);
@@ -2815,10 +3006,18 @@ void GenerationService::on_token(const std::string& id, int64_t token,
         if (r->prefix_hit) {
           stats_.ttft_hit_count++;
           stats_.ttft_hit_ms += ms;
+          stats_.ttft_hit_s.observe(ms / 1000.0);
         } else {
           stats_.ttft_miss_count++;
           stats_.ttft_miss_ms += ms;
+          stats_.ttft_miss_s.observe(ms / 1000.0);
         }
+        r->first_token_seen = true;
+        r->first_token_at = now;
+        r->last_pass_at = now;
+        r->last_pass_tokens = 1;
+        if (r->admit_seen)
+          stats_.prefill_s.observe(std::chrono::duration<double>(now - r->admitted_at).count());
       } else if (steps_done > 1) {
         // Later tokens: the inter-token gap — the spacing of consecutive
         // token arrivals of this choice. A speculative step's extra tokens
@@ -2893,6 +3092,18 @@ void GenerationService::on_prefix(const std::string& id, const char* op,
     }
   }
   if (audit_) audit_->on_prefix(id, op, position, slot);
+}
+
+void GenerationService::on_admit(const std::string& id, int slot) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  for (auto& r : records_) {
+    if (r->sched_id != id || r->admit_seen) continue;
+    r->admit_seen = true;
+    r->admitted_at = std::chrono::steady_clock::now();
+    stats_.queue_s.observe(std::chrono::duration<double>(r->admitted_at - r->arrived).count());
+    break;
+  }
+  if (audit_) audit_->on_admit(id, slot);
 }
 
 std::vector<int64_t> GenerationService::prompt_boundaries(
@@ -3028,6 +3239,13 @@ std::string GenerationService::legacy_logprobs(const StreamRecord& r, size_t fro
          "],\"top_logprobs\":" + tops + "],\"text_offset\":" + offsets + "]}";
 }
 
+void GenerationService::observe_token_pass(StreamRecord& r, std::chrono::steady_clock::time_point now) {
+  if (!r.first_token_seen || r.ids.size() <= r.last_pass_tokens) return;
+  stats_.itl_s.observe(std::chrono::duration<double>(now - r.last_pass_at).count());
+  r.last_pass_at = now;
+  r.last_pass_tokens = r.ids.size();
+}
+
 void GenerationService::on_retire(const std::string& id,
                                  const Scheduler::Result& result) {
   {
@@ -3053,6 +3271,20 @@ void GenerationService::on_retire(const std::string& id,
       }
       r->done = true;
       r->reason = result.reason;
+      {
+        const auto now = std::chrono::steady_clock::now();
+        observe_token_pass(*r, now);
+        stats_.e2e_s.observe(std::chrono::duration<double>(now - r->arrived).count());
+        stats_.prompt_tokens.observe(r->prompt_tokens);
+        stats_.generation_tokens.observe(result.steps_done);
+        if (r->first_token_seen) {
+          const double decode = std::chrono::duration<double>(now - r->first_token_at).count();
+          stats_.decode_s.observe(decode);
+          if (result.steps_done > 1) stats_.tpot_s.observe(decode / (result.steps_done - 1));
+        }
+        const int reason = static_cast<int>(result.reason);
+        if (reason >= 0 && reason < Stats::kReasons) ++stats_.finished[reason];
+      }
       // A stopped request's tokens past the match were generated but never
       // shown: the usage counts up to the token that completed the match.
       r->completion_tokens = r->stopped ? r->stop_tokens : result.steps_done;
@@ -3477,6 +3709,27 @@ bool GenerationService::engine_pass(const PreTickHook& pre_tick) {
     cancels.swap(pending_cancels_);
     stops.swap(pending_stops_);
   }
+  // The arrival gather: requests sent together reach the engine a few
+  // milliseconds apart (their HTTP parse and tokenization), and the first
+  // would otherwise start its read-in alone, one tick ahead of the rest.
+  // An idle engine waits once for the burst — rank 0's timing only: the
+  // peers replay the journal's order.
+  if (cfg_.admission_gather_ms > 0 && !admissions.empty()) {
+    const auto meters = sched_.meters();
+    if (meters.active == 0 && meters.queued == 0) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(cfg_.admission_gather_ms));
+      std::lock_guard<std::mutex> lock(mutex_);
+      admissions.insert(admissions.end(), std::make_move_iterator(pending_admissions_.begin()),
+                        std::make_move_iterator(pending_admissions_.end()));
+      pending_admissions_.clear();
+      cancels.insert(cancels.end(), std::make_move_iterator(pending_cancels_.begin()),
+                     std::make_move_iterator(pending_cancels_.end()));
+      pending_cancels_.clear();
+      stops.insert(stops.end(), std::make_move_iterator(pending_stops_.begin()),
+                   std::make_move_iterator(pending_stops_.end()));
+      pending_stops_.clear();
+    }
+  }
   PassEvents events;
   // The admissions' queue wait, accumulated lock-free and flushed to the
   // stats in one lock (stats_ is mutex-guarded; the loop is not).
@@ -3568,6 +3821,16 @@ bool GenerationService::engine_pass(const PreTickHook& pre_tick) {
     meters_ = sched_.meters();
     prefix_stats_ = engine_->prefix_engine_stats();
     meters_published_ = std::chrono::steady_clock::now();
+    // The pass's decode steps, each at the pass's mean step time.
+    const int64_t steps = meters_.decode_steps - observed_decode_steps_;
+    if (steps > 0) {
+      const double each_s = (meters_.step_ms - observed_step_ms_) / 1000.0 / static_cast<double>(steps);
+      for (int64_t i = 0; i < steps; ++i) stats_.step_s.observe(each_s);
+    }
+    observed_decode_steps_ = meters_.decode_steps;
+    observed_step_ms_ = meters_.step_ms;
+    // One inter-token gap per request per pass that delivered its tokens.
+    for (auto& r : records_) observe_token_pass(*r, meters_published_);
     return more || !pending_admissions_.empty();
   }
 }

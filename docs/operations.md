@@ -139,6 +139,26 @@ that buffer. Hidden states retain their original layout for cache snapshots
 and MTP. For a vocabulary shard of `V` entries, a prefill capacity `T` and
 decode capacity `D`, this saves `(T - D) * V * 4` device bytes per rank.
 
+Qwen3.8-27B-FP8 (`qwen3_5`) serves its native block-FP8 projections exactly by
+default: decode rows through the block-scaled FP8 GEMV / streaming MMA, prefill
+through the dequantized bf16 GEMM, the BF16 lm head as shipped. Two opt-in
+levers trade exactness for speed and must be named in the config:
+`engine.dense_weights: "fp8"` requantizes the lm head to block FP8 (half its
+bytes per decode row, 15 ms of a 3-row MTP pass; the templates ship it, the
+eval holds at 39/40 on HumanEval and GSM8K and the acceptance is unchanged), and
+`engine.prefill_fp8_per_tensor: true` runs the prefill GEMMs on cuBLASLt's
+per-tensor e4m3 kernels (about 2x the prefill rate, +23 GiB resident). Both
+change greedy transcripts (the head within the first tokens, the prefill
+recipe at long context), so a deployment that enables them is not the
+checkpoint's model. The family is world-1 only.
+
+Its DFlash2 drafter (`engine.dflash_model`, the `_dflash2` template) runs the
+eager world-1 engine with `mtp` and `decode_graph` off; its own options are
+`engine.dflash_verify_graph` (the multi-slot verify as a captured graph, the
+default), `engine.dflash_draft_batch` (stacked redrafts, the default) and
+`engine.dflash_depth` (a verify-depth cap, 0 = the block). None of them
+changes a transcript: the drafter only proposes, the greedy verify decides.
+
 Qwen FP8 and packed heads keep the full product's kernel selection and
 accumulation order. BF16 heads use the existing small-row projection, which
 can change FP32 rounding. Acceptance uses an FP64 oracle and teacher-forced
@@ -908,11 +928,16 @@ the prompts. Its artifacts land under `build-ci/fabric-runs/failure_drill_*`.
   during a synchronous prefill. `scheduler.snapshot_age_ms` reports the age of
   the remaining scheduler/pool counters. See the
   [metrics contract and monitoring command](openai-compatibility.md#metrics-and-prefill-progress).
-  Both metrics paths return `application/json`; direct Prometheus
-  scraping requires a supported
-  [exposition format](https://prometheus.io/docs/instrumenting/exposition_formats/),
-  which DGPP does not yet provide. `GET /health` is `{"status":"ok"}`
-  while the engine lives.
+  Both metrics paths return `application/json`. `GET /metrics/prometheus`
+  serves the same counters in the Prometheus
+  [text format](https://prometheus.io/docs/instrumenting/exposition_formats/),
+  with TTFT, queue, prefill, decode, end-to-end, inter-token and step-time
+  histograms (the
+  [family list](openai-compatibility.md#prometheus-exposition)); scrape rank
+  0 for the service; with `ports.metrics` set in the deployment JSON, each peer serves its own
+  `dgpp_rank_*` step, prefill and pool meters on that port of its node
+  address ([per-rank families](openai-compatibility.md#per-rank-families)).
+  `GET /health` is `{"status":"ok"}` while the engine lives.
 - **Under load:** `scripts/serve_soak_run.sh MINUTES OUT_DIR` boots the
   world with the production knobs, starts `scripts/node_probe.sh` on every
   node, runs `scripts/serve_soak.py` (multi-turn chat, long generations,

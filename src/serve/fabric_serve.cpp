@@ -394,8 +394,24 @@ std::string encode_journal_settings(const WorldSettings& s) {
   append_json_string(&out, s.bf16_weights);
   out += ",\"dv\":";
   append_json_string(&out, s.draft_vocab);
-  out += std::format(",\"pfb16\":{},\"pffold\":{},\"pffp8\":{}", s.prefill_bf16_partials ? 1 : 0,
-                     s.prefill_fold_scales ? 1 : 0, s.prefill_fp8_gemm ? 1 : 0);
+  out += std::format(",\"pfb16\":{},\"pffold\":{},\"pffp8\":{},\"pfpt\":{}", s.prefill_bf16_partials ? 1 : 0,
+                     s.prefill_fold_scales ? 1 : 0, s.prefill_fp8_gemm ? 1 : 0,
+                     s.prefill_fp8_per_tensor ? 1 : 0);
+  out += ",\"dfm\":";
+  append_json_string(&out, s.dflash_model);
+  out += std::format(",\"dfvg\":{},\"dfdb\":{},\"dfdp\":{}", s.dflash_verify_graph ? 1 : 0,
+                     s.dflash_draft_batch ? 1 : 0, s.dflash_depth);
+  out += ",\"dfw\":";
+  append_json_string(&out, s.dflash_weights);
+  out += std::format(",\"pfg\":{}", s.prefill_group ? 1 : 0);
+  out += std::format(",\"l2p\":{},\"l2m\":{},\"l2w\":{},\"l2bw\":{}", s.l2_prefetch ? 1 : 0, s.l2_prefetch_merge ? 1 : 0,
+                     s.l2_prefetch_window_mib, s.l2_prefetch_boundary_window_mib);
+  out += ",\"l2f\":";
+  append_json_string(&out, s.l2_prefetch_form);
+  out += ",\"l2b\":";
+  append_json_string(&out, s.l2_prefetch_boundary_rate);
+  out += ",\"l2l\":";
+  append_json_string(&out, s.l2_prefetch_layer_rate);
   out += ",\"xgemm\":";
   append_json_string(&out, s.expert_gemm);
   out += std::format(",\"xpf\":{},\"xtl\":{},\"xpair\":{},\"npre\":{}", s.expert_gemm_prefetch,
@@ -414,9 +430,17 @@ std::string encode_journal_settings(const WorldSettings& s) {
   }
   out += ",\"emsh\":";
   append_json_string(&out, s.embed_sharding);
-  out += std::format(",\"mss\":{},\"msrow\":{:.17g},\"msbase\":{:.17g},\"mslam\":{:.17g},\"msmin\":{},\"msad\":{}",
+  out += std::format(",\"mss\":{},\"msrow\":{:.17g},\"msbase\":{:.17g},\"mslam\":{:.17g},\"msmin\":{},\"msad\":{},"
+                     "\"msss\":{:.17g}",
                      s.mtp_schedule ? 1 : 0, s.mtp_schedule_row_ms, s.mtp_schedule_base_ms,
-                     s.mtp_schedule_lambda, s.mtp_schedule_min_depth, s.mtp_schedule_adapt ? 1 : 0);
+                     s.mtp_schedule_lambda, s.mtp_schedule_min_depth, s.mtp_schedule_adapt ? 1 : 0,
+                     s.mtp_schedule_sampled_scale);
+  out += ",\"mdr\":";
+  append_json_string(&out, s.mtp_draft);
+  out += std::format(",\"mdt\":{:.17g}", s.mtp_draft_temperature);
+  out += ",\"mvf\":";
+  append_json_string(&out, s.mtp_verify);
+  out += std::format(",\"dbr\":{}", s.dflash_batch_rows);
   out.push_back('}');
   return out;
 }
@@ -584,6 +608,25 @@ JournalRecord decode_journal_line(std::string_view line) {
     if (v.find("pfb16")) s.prefill_bf16_partials = flag("pfb16");
     if (v.find("pffold")) s.prefill_fold_scales = flag("pffold");
     if (v.find("pffp8")) s.prefill_fp8_gemm = flag("pffp8");
+    if (v.find("pfpt")) s.prefill_fp8_per_tensor = flag("pfpt");  // 2026-10-03: the 27B recipe
+    // The DFlash2 drafter (2026-10-03): records before it carry none.
+    if (const dgpp::minijson::Value* dfm = v.find("dfm")) s.dflash_model = std::string(dfm->as_string());
+    if (v.find("dfvg")) s.dflash_verify_graph = flag("dfvg");
+    if (v.find("dfdb")) s.dflash_draft_batch = flag("dfdb");
+    if (const dgpp::minijson::Value* dfdp = v.find("dfdp")) s.dflash_depth = static_cast<int>(dfdp->as_int());
+    // Records before 2026-10-05 carry no drafter weight format: the checkpoint's.
+    if (const dgpp::minijson::Value* dfw = v.find("dfw")) s.dflash_weights = std::string(dfw->as_string());
+    if (s.dflash_weights != "checkpoint" && s.dflash_weights != "fp8")
+      throw std::runtime_error("worker settings: dfw must be checkpoint or fp8");
+    if (v.find("pfg")) s.prefill_group = flag("pfg");  // records before 2026-10-05: grouped
+    // The L2 prefetcher (2026-10-05); records before it carry the defaults.
+    if (v.find("l2p")) s.l2_prefetch = flag("l2p");
+    if (v.find("l2m")) s.l2_prefetch_merge = flag("l2m");
+    if (const dgpp::minijson::Value* w = v.find("l2w")) s.l2_prefetch_window_mib = static_cast<int>(w->as_int());
+    if (const dgpp::minijson::Value* w = v.find("l2bw")) s.l2_prefetch_boundary_window_mib = static_cast<int>(w->as_int());
+    if (const dgpp::minijson::Value* f = v.find("l2f")) s.l2_prefetch_form = std::string(f->as_string());
+    if (const dgpp::minijson::Value* r = v.find("l2b")) s.l2_prefetch_boundary_rate = std::string(r->as_string());
+    if (const dgpp::minijson::Value* r = v.find("l2l")) s.l2_prefetch_layer_rate = std::string(r->as_string());
     // The expert GEMM's form and companions (2026-09-30): records before them carry the defaults.
     if (const dgpp::minijson::Value* xg = v.find("xgemm")) s.expert_gemm = std::string(xg->as_string());
     if (const dgpp::minijson::Value* xpf = v.find("xpf")) s.expert_gemm_prefetch = static_cast<int>(xpf->as_int());
@@ -627,7 +670,27 @@ JournalRecord decode_journal_line(std::string_view line) {
       // Records before the adaptive lambda (2026-09-14, later) carry no msad: fixed.
       if (const dgpp::minijson::Value* msad = v.find("msad")) s.mtp_schedule_adapt = msad->as_int() != 0;
       else s.mtp_schedule_adapt = false;
+      // Records before 2026-10-02 carry no sampled scale: sampled requests
+      // verify the whole block.
+      if (const dgpp::minijson::Value* msss = v.find("msss")) s.mtp_schedule_sampled_scale = msss->as_double();
+      else s.mtp_schedule_sampled_scale = 0.0;
+      if (!(s.mtp_schedule_sampled_scale >= 0.0 && s.mtp_schedule_sampled_scale <= 1.0))
+        throw std::runtime_error("worker settings: msss must be in [0, 1]");
     }
+    // Records before 2026-10-01 carry no draft rule: the family's default.
+    if (const dgpp::minijson::Value* mdr = v.find("mdr")) s.mtp_draft = std::string(mdr->as_string());
+    if (s.mtp_draft != "auto" && s.mtp_draft != "sampled" && s.mtp_draft != "greedy")
+      throw std::runtime_error("worker settings: mdr must be auto, sampled or greedy");
+    // Records before 2026-10-05 carry no draft temperature: the request's.
+    if (const dgpp::minijson::Value* mdt = v.find("mdt")) s.mtp_draft_temperature = mdt->as_double();
+    if (!(s.mtp_draft_temperature > 0.0 && s.mtp_draft_temperature <= 4.0))
+      throw std::runtime_error("worker settings: mdt must be in (0, 4]");
+    // Records before 2026-10-05 carry no verify rule: the token rule.
+    if (const dgpp::minijson::Value* mvf = v.find("mvf")) s.mtp_verify = std::string(mvf->as_string());
+    if (s.mtp_verify != "token" && s.mtp_verify != "block")
+      throw std::runtime_error("worker settings: mvf must be token or block");
+    if (const dgpp::minijson::Value* dbr = v.find("dbr")) s.dflash_batch_rows = static_cast<int>(dbr->as_int());
+    if (s.dflash_batch_rows < 0) throw std::runtime_error("worker settings: dbr must be >= 0");
     if (s.world < 2 || s.max_concurrency < 1 || s.kv_capacity < 1 ||
         (s.admission != "full" && s.admission != "grow") ||
         !latent_format_from_string(s.kv_dtype) ||
@@ -1171,7 +1234,8 @@ void run_journal_peer(Scheduler* sched, JournalReader* reader,
                       const std::function<void()>& on_rank0_death,
                       int watch_poll_ms,
                       const dgpp::sched::SchedulerObserver* oplog,
-                      ThroughputLog* stats) {
+                      ThroughputLog* stats,
+                      const std::function<void(const Scheduler::Meters&, int64_t)>& on_tick) {
   int64_t ticks = 0;  // records applied (the drift check names the tick)
   // The in-tick watch (the death discipline, fabric_serve.hpp): only while
   // the loop is inside a tick can rank 0's death go unseen by the read
@@ -1247,7 +1311,11 @@ void run_journal_peer(Scheduler* sched, JournalReader* reader,
       sched->tick();
     }
     ++ticks;
-    if (stats) stats->observe(sched->meters(), nullptr);
+    if (stats || on_tick) {
+      const Scheduler::Meters m = sched->meters();
+      if (stats) stats->observe(m, nullptr);
+      if (on_tick) on_tick(m, ticks);
+    }
   }
 }
 
